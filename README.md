@@ -35,6 +35,26 @@ Forge Neo enables MOSS-Image Skip Layer Guidance by default, from 0 to 0.5. It i
 
 When SLG stops halfway, the negative prompt's model call changes, so its forecast history starts over while the positive side keeps forecasting. The two drift out of step, and a run can go many steps without one fully real step. That costs speed and, under ER SDE, image quality.
 
+## Examples
+
+MOSS-Image Base (int8), 1024x1024, CFG 4.5, seed 42, one prompt with text and floury hands. "Calls" counts cond and uncond separately.
+
+With the Manual defaults, Euler runs 42 of 100 transformer calls and the image stays close to the unaccelerated one, down to the flour on the fingers. A shorter warmup is faster but moves the layout.
+
+![Euler 50 steps: no Spectrum, Manual default, warmup 6](img/euler_manual.jpg)
+
+Under ER SDE the default runs 34 of 50 calls. Warmup decides the layout here too.
+
+![ER SDE 25 steps: no Spectrum, Manual default, warmup 5](img/ersde_manual.jpg)
+
+What a longer forecast streak does to ER SDE, and why Manual is capped at one forecast in a row there:
+
+![ER SDE ghosting with up to 8 forecasts in a row](img/ersde_ghosting.jpg)
+
+Adaptive mode and Forge Neo's built-in Spectrum Integrated, from an earlier run with SLG ending at 0.5. Times are the sampling loop on one test machine.
+
+![Euler 50 steps: no Spectrum, Adaptive, built-in Spectrum](img/adaptive_builtin.jpg)
+
 ## Modes
 
 ### Manual (default)
