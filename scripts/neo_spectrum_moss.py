@@ -45,15 +45,14 @@ class NeoSpectrumMOSS(scripts.Script):
         with InputAccordion(False, label=self.title()) as enable:
             mode = gr.Radio(value=MANUAL, choices=[MANUAL, ADAPTIVE], label="Mode", info="Manual is a fixed schedule; Adaptive measures forecast error at each real step and adjusts")
 
-            tail_actual_steps = gr.Slider(minimum=0, maximum=64, value=2, step=1, label="Tail actual steps", info="last steps that always run the full transformer; higher = safer")
-
             with gr.Group(visible=True) as g_manual:
                 with gr.Row():
-                    manual_warmup_steps = gr.Slider(minimum=0, maximum=64, value=4, step=1, label="Warmup steps", info="first steps that always run the full transformer; higher = safer")
-                    max_consecutive_forecasts = gr.Slider(minimum=0, maximum=32, value=8, step=1, label="Max consecutive forecasts", info="forecasts allowed in a row before a real step; higher = faster, riskier")
+                    manual_warmup_steps = gr.Slider(minimum=0, maximum=64, value=8, step=1, label="Warmup steps", info="first steps that always run the full transformer; below 8 the layout changes")
+                    manual_tail_steps = gr.Slider(minimum=0, maximum=64, value=3, step=1, label="Tail actual steps", info="last steps that always run the full transformer; higher = safer")
                 with gr.Row():
-                    manual_window_size = gr.Slider(minimum=1.0, maximum=16.0, value=8.0, step=0.25, label="Window size", info="starting forecast window before a real step")
-                    manual_flex_window = gr.Slider(minimum=0.0, maximum=8.0, value=2.0, step=0.05, label="Window growth", info="how much the window grows after each refresh")
+                    manual_window_size = gr.Slider(minimum=1.0, maximum=16.0, value=3.0, step=0.25, label="Window size", info="starting forecast window before a real step")
+                    manual_flex_window = gr.Slider(minimum=0.0, maximum=8.0, value=0.5, step=0.05, label="Window growth", info="how much the window grows after each refresh")
+                max_consecutive_forecasts = gr.Slider(minimum=0, maximum=32, value=3, step=1, label="Max consecutive forecasts", info="forecasts allowed in a row before a real step; higher = faster, riskier. ER SDE: 1")
                 with gr.Row():
                     history_points = gr.Slider(minimum=2, maximum=32, value=8, step=1, label="History points", info="real hidden states kept for the predictor; more uses more memory. ER SDE: ignored")
                     chebyshev_degree = gr.Slider(minimum=1, maximum=12, value=4, step=1, label="Chebyshev degree", info="higher fits more complex trends, may be less stable. ER SDE: ignored")
@@ -65,10 +64,12 @@ class NeoSpectrumMOSS(scripts.Script):
             with gr.Group(visible=False) as g_adaptive:
                 with gr.Row():
                     adaptive_warmup_steps = gr.Slider(minimum=0, maximum=64, value=8, step=1, label="Adaptive warmup steps", info="first steps that always run the full transformer; higher = safer")
+                    adaptive_tail_steps = gr.Slider(minimum=0, maximum=16, value=2, step=1, label="Adaptive tail steps", info="last steps that always run the full transformer; higher = safer")
+                with gr.Row():
                     detail_guard_steps = gr.Slider(minimum=0, maximum=32, value=8, step=1, label="Detail guard steps", info="after warmup, at most one forecast between real steps; higher = safer early detail")
                 with gr.Row():
                     post_guard_horizon_cap = gr.Slider(minimum=1, maximum=16, value=6, step=1, label="Post-guard horizon cap", info="longest forecast streak after the guard; higher = faster, riskier. ER SDE: 1")
-                    error_tolerance = gr.Slider(minimum=0.75, maximum=1.5, value=1.0, step=0.05, label="Error tolerance", info="forecast error tolerated before backing off; higher = faster, riskier")
+                error_tolerance = gr.Slider(minimum=0.75, maximum=1.5, value=1.0, step=0.05, label="Error tolerance", info="forecast error tolerated before backing off; higher = faster, riskier")
                 with gr.Row():
                     adaptive_window_size = gr.Slider(minimum=1.0, maximum=16.0, value=2.0, step=0.25, label="Forecast budget", info="starting forecast budget before the next real step. ER SDE: ignored")
                     adaptive_flex_window = gr.Slider(minimum=0.0, maximum=8.0, value=0.5, step=0.05, label="Budget growth", info="how fast the budget grows after good refreshes. ER SDE: ignored")
@@ -91,10 +92,11 @@ class NeoSpectrumMOSS(scripts.Script):
         self.infotext_fields = [
             (enable, lambda d: "Spectrum MOSS mode" in d),
             (mode, "Spectrum MOSS mode"),
-            (tail_actual_steps, "Spectrum MOSS tail"),
-            #   one infotext key for both warmup sliders: the restored mode picks which one counts
+            #   one infotext key per pair of sliders: the restored mode picks which one counts
             (manual_warmup_steps, "Spectrum MOSS warmup"),
             (adaptive_warmup_steps, "Spectrum MOSS warmup"),
+            (manual_tail_steps, "Spectrum MOSS tail"),
+            (adaptive_tail_steps, "Spectrum MOSS tail"),
             (detail_guard_steps, "Spectrum MOSS detail guard"),
             (post_guard_horizon_cap, "Spectrum MOSS horizon cap"),
             (adaptive_window_size, "Spectrum MOSS adaptive window"),
@@ -113,9 +115,10 @@ class NeoSpectrumMOSS(scripts.Script):
         return [
             enable,
             mode,
-            tail_actual_steps,
             manual_warmup_steps,
+            manual_tail_steps,
             adaptive_warmup_steps,
+            adaptive_tail_steps,
             detail_guard_steps,
             post_guard_horizon_cap,
             adaptive_window_size,
@@ -136,7 +139,7 @@ class NeoSpectrumMOSS(scripts.Script):
         ]
 
     @staticmethod
-    def make_config(mode, tail_actual_steps, manual_warmup_steps, adaptive_warmup_steps, detail_guard_steps, post_guard_horizon_cap, adaptive_window_size, adaptive_flex_window, error_tolerance, manual_window_size, manual_flex_window, max_consecutive_forecasts, history_points, chebyshev_degree, ridge_lambda, blend_weight, force_actual_on_control, cache_device, debug) -> tuple[core.SpectrumConfig, dict]:
+    def make_config(mode, manual_warmup_steps, manual_tail_steps, adaptive_warmup_steps, adaptive_tail_steps, detail_guard_steps, post_guard_horizon_cap, adaptive_window_size, adaptive_flex_window, error_tolerance, manual_window_size, manual_flex_window, max_consecutive_forecasts, history_points, chebyshev_degree, ridge_lambda, blend_weight, force_actual_on_control, cache_device, debug) -> tuple[core.SpectrumConfig, dict]:
         """UI values -> the config the node would have built, and the infotext for it.
 
         Adaptive pins the predictor shape to the validated constants and always forces real
@@ -146,7 +149,7 @@ class NeoSpectrumMOSS(scripts.Script):
             config = core.SpectrumConfig(
                 mode="manual",
                 warmup_steps=int(manual_warmup_steps),
-                tail_actual_steps=int(tail_actual_steps),
+                tail_actual_steps=int(manual_tail_steps),
                 window_size=float(manual_window_size),
                 flex_window=float(manual_flex_window),
                 max_consecutive_forecasts=int(max_consecutive_forecasts),
@@ -172,7 +175,7 @@ class NeoSpectrumMOSS(scripts.Script):
             config = core.SpectrumConfig(
                 mode="adaptive",
                 warmup_steps=int(adaptive_warmup_steps),
-                tail_actual_steps=int(tail_actual_steps),
+                tail_actual_steps=int(adaptive_tail_steps),
                 window_size=float(adaptive_window_size),
                 flex_window=float(adaptive_flex_window),
                 history_points=core._ADAPTIVE_HISTORY_POINTS,
@@ -239,7 +242,8 @@ class NeoSpectrumMOSS(scripts.Script):
         p.sd_model.forge_objects.unet = patched
         p.extra_generation_params.update(params)
         if how == "er_sde":
-            logger.info("Spectrum MOSS: ER SDE detected, forecasts go through the solver-space bridge")
+            capped = config.mode == "manual" and config.max_consecutive_forecasts > 1
+            logger.info("Spectrum MOSS: ER SDE detected, forecasts go through the solver-space bridge" + (", at most 1 in a row" if capped else ""))
 
     def postprocess(self, p, processed, *args):
         cls = NeoSpectrumMOSS

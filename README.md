@@ -20,7 +20,7 @@ Or clone into your Forge Neo `extensions` folder and restart. No extra dependenc
 
 ## Usage
 
-Open the **Spectrum MOSS-Image** accordion, tick it, and generate. The console reports how many transformer calls ran, for example `50 steps, 46 of 100 transformer calls run (2.17x fewer)` (cond and uncond count separately).
+Open the **Spectrum MOSS-Image** accordion, tick it, and generate. The console reports how many transformer calls ran, for example `50 steps, 42 of 100 transformer calls run (2.38x fewer)` (cond and uncond count separately).
 
 Recommended settings, from the original:
 
@@ -29,28 +29,32 @@ Recommended settings, from the original:
 
 Other samplers run, but only Euler and ER SDE were validated; the console warns once per pass (Advanced → Warn on unverified samplers turns that off).
 
-### Skip Layer Guidance
+### Skip Layer Guidance: set End Percent to 1.0
 
-Forge Neo enables MOSS-Image Skip Layer Guidance by default, from 0 to 0.5 (Settings → Moss-Image). While SLG runs, cond and uncond are separate model calls; when it stops, they are batched into one, and the forecaster has to learn that new call from scratch. That costs about five real steps at the midpoint. For the most speed, set **End Percent** to 1.0, as the original's README recommends for ComfyUI.
+Forge Neo enables MOSS-Image Skip Layer Guidance by default, from 0 to 0.5. It is in **Settings → Stable Diffusion**, under "[Moss-Image] Enable Skip Layer Guidance" (type `Skip Layer` into the settings search). Set **End Percent** to **1.0**, as the original's README recommends for ComfyUI.
+
+When SLG stops halfway, the negative prompt's model call changes, so its forecast history starts over while the positive side keeps forecasting. The two drift out of step, and a run can go many steps without one fully real step. That costs speed and, under ER SDE, image quality.
 
 ## Modes
 
 ### Manual (default)
 
-The original's **Spectrum MOSS-Image (Manual)** node: a fixed expanding-window schedule. The defaults here are faster than the node's (warmup 8, window 2.0, growth 0.75, 2 forecasts in a row); the node's values are in brackets.
+The original's **Spectrum MOSS-Image (Manual)** node: a fixed expanding-window schedule. The defaults come from live tests on MOSS-Image (Euler, 50 steps, SLG End Percent 1.0): about 2.4x fewer transformer calls with an image close to the unaccelerated one. The node's own values are in brackets.
 
 | Control | Default | Description |
 | --- | --- | --- |
-| Warmup steps | 4 (8) | First steps that always run the transformer. |
-| Tail actual steps | 2 | Last steps that always run the transformer. Shared by both modes. |
-| Max consecutive forecasts | 8 (2) | Forecasts allowed in a row before a real step. The original recommends 1 under ER SDE. |
-| Window size | 8.0 (2.0) | Starting forecast window before a real step. |
-| Window growth | 2.0 (0.75) | How much the window grows after each refresh. |
+| Warmup steps | 8 | First steps that always run the transformer. MOSS-Image is still placing the composition until about step 8; a lower warmup changes the layout. |
+| Tail actual steps | 3 (2) | Last steps that always run the transformer. A longer tail (8) made no visible difference. |
+| Window size | 3.0 (2.0) | Starting forecast window before a real step. |
+| Window growth | 0.5 (0.75) | How much the window grows after each refresh. |
+| Max consecutive forecasts | 3 (2) | Forecasts allowed in a row before a real step. **ER SDE: always 1**, see below. |
 | History points | 8 | Real hidden states kept for the predictor. ER SDE: fixed at 8. |
 | Chebyshev degree | 4 | Polynomial degree of the predictor. ER SDE: fixed at 4. |
 | Ridge lambda | 0.1 | Regularisation; higher damps extrapolation. ER SDE: fixed at 0.1. |
 | Blend weight | 0.5 | 0 = linear extrapolation only, 1 = spectral only. ER SDE: fixed at 0.5. |
 | Real steps while a ControlNet is active | on | |
+
+**ER SDE caps Manual at one forecast in a row,** whatever the slider says, which is where this port departs from the original node. The ER SDE bridge can only extrapolate from two consecutive real steps. After a longer streak it has to reuse the last real result while ER SDE keeps adding noise, and the image ghosts: doubled outlines and translucent duplicate fingers in a live test with 8 in a row. Adaptive already caps itself the same way. With the default warmup of 8, ER SDE at 25 steps runs about 1.5x fewer transformer calls.
 
 ### Adaptive
 
@@ -59,6 +63,7 @@ The original's **Spectrum MOSS-Image (Adaptive)** node, with its defaults. At ev
 | Control | Default | Description |
 | --- | --- | --- |
 | Adaptive warmup steps | 8 | First steps that always run the transformer. |
+| Adaptive tail steps | 2 | Last steps that always run the transformer. |
 | Detail guard steps | 8 | After warmup, at most one forecast between real steps. |
 | Post-guard horizon cap | 6 | Longest forecast streak after the guard. ER SDE: 1. |
 | Error tolerance | 1.0 | Forecast error tolerated before backing off. Higher = faster, riskier. |
@@ -78,7 +83,7 @@ All settings are written to the infotext and restored by "Read generation parame
 
 ## Implementation notes
 
-The scheduler, the forecaster and the adaptive controller (`lib_spectrum_moss/core.py`) are the original's code, unchanged apart from two flags that Forge supplies differently. What is new:
+The scheduler, the forecaster and the adaptive controller (`lib_spectrum_moss/core.py`) are the original's code, unchanged apart from two flags that Forge supplies differently and the ER SDE cap on Manual described above. What is new:
 
 - **Hook.** The node wraps the diffusion model; Forge Neo's nearest hook is the `model_function_wrapper` around `KModel.apply_model`. A forecast step reproduces what `apply_model` does around the transformer: `calculate_input`, the head at `predictor.timestep(sigma)`, `calculate_denoised`. Another extension's wrapper already in that slot is chained, not replaced, and sees only the real steps.
 - **Step index.** It comes from `transformer_options["sampling_sigmas"]`, rebased to the first sigma of the run: for img2img and the hires pass Forge publishes the full schedule while the sampler runs only its tail, so without the rebase warmup and the detail guard would be skipped.

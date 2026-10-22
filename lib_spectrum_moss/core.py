@@ -3,7 +3,8 @@
 # Scheduler, forecaster and adaptive controller of ComfyUI-Spectrum-MOSS v0.8.0
 # (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS, nodes.py), kept verbatim where it
 # does not touch ComfyUI so that Forge Neo makes the same actual/forecast decisions
-# as the validated node.  Based on the method from arXiv:2603.01623.
+# as the validated node. One deliberate change: Manual is capped at one forecast in a
+# row under ER-SDE (`_runtime_config`).  Based on the method from arXiv:2603.01623.
 #
 # SPDX-License-Identifier: GPL-3.0-only
 
@@ -504,10 +505,14 @@ def _patch_signature(transformer_options: dict) -> tuple[str, ...]:
 def _runtime_config(config: SpectrumConfig, er_sde: bool) -> SpectrumConfig:
     """Apply only sampler-specific runtime policy overrides.
 
-    ER-SDE uses the predictor settings validated by the bridge tests. Manual
-    scheduling controls remain user-controlled. Adaptive keeps its error/guard
-    logic, but ER-SDE caps the forecast horizon at one and therefore ignores
-    its window-growth controls.
+    ER-SDE uses the predictor settings validated by the bridge tests. Adaptive
+    keeps its error/guard logic, but ER-SDE caps the forecast horizon at one and
+    therefore ignores its window-growth controls.
+
+    Neo-Spectrum-MOSS departs from the node here: Manual is capped at one
+    forecast in a row as well. The bridge extrapolates only from two adjacent
+    real steps; after a longer streak it holds the last real result while ER
+    SDE keeps adding noise, which ghosts (seen live on 2026-10-22).
     """
     if not er_sde:
         return config
@@ -524,6 +529,7 @@ def _runtime_config(config: SpectrumConfig, er_sde: bool) -> SpectrumConfig:
         )
     return replace(
         config,
+        max_consecutive_forecasts=min(config.max_consecutive_forecasts, 1),
         history_points=_ADAPTIVE_HISTORY_POINTS,
         chebyshev_degree=_ADAPTIVE_CHEBYSHEV_DEGREE,
         ridge_lambda=_ADAPTIVE_RIDGE_LAMBDA,
