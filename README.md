@@ -20,7 +20,7 @@ Or clone into your Forge Neo `extensions` folder and restart. No extra dependenc
 
 ## Usage
 
-Open the **Spectrum MOSS-Image** accordion, tick it, and generate. The console reports how many transformer calls ran, for example `50 steps, 42 of 100 transformer calls run (2.38x fewer)` (cond and uncond count separately).
+Open the **Spectrum MOSS-Image** accordion, tick it, and generate. The console reports how many transformer calls ran, for example `50 steps, 51 of 100 transformer calls run (1.96x fewer)` (cond and uncond count separately).
 
 Recommended settings, from the original:
 
@@ -57,9 +57,23 @@ Adaptive mode and Forge Neo's built-in Spectrum Integrated, from an earlier run 
 
 ## Modes
 
-### Manual (default)
+### Adaptive (default)
 
-The original's **Spectrum MOSS-Image (Manual)** node: a fixed expanding-window schedule. The defaults come from live tests on MOSS-Image (Euler, 50 steps, SLG End Percent 1.0): about 2.4x fewer transformer calls with an image close to the unaccelerated one. The node's own values are in brackets.
+The original's **Spectrum MOSS-Image (Adaptive)** node, with its defaults. It is the default because it measures its own forecast error at every real step and backs off when the error grows, so it does not depend on the sampler, the schedule or a Turbo LoRA matching what the defaults were tuned on. At every real step it measures how far the forecast would have been off, on a sample of image tokens (95th and 99th percentile, so a small drifting region such as a hand is not averaged away), and shortens or lengthens the forecast streak.
+
+| Control | Default | Description |
+| --- | --- | --- |
+| Adaptive warmup steps | 8 | First steps that always run the transformer. |
+| Adaptive tail steps | 2 | Last steps that always run the transformer. |
+| Detail guard steps | 8 | After warmup, at most one forecast between real steps. |
+| Post-guard horizon cap | 6 | Longest forecast streak after the guard. ER SDE: 1. |
+| Error tolerance | 1.0 | Forecast error tolerated before backing off. Higher = faster, riskier. |
+| Forecast budget | 2.0 | Starting forecast budget before the next real step (the node's `window_size`). ER SDE: ignored. |
+| Budget growth | 0.5 | How fast the budget grows after good refreshes (the node's `flex_window`). ER SDE: ignored. |
+
+### Manual
+
+The original's **Spectrum MOSS-Image (Manual)** node: a fixed expanding-window schedule. It is faster than Adaptive, but a fixed schedule suits only the setups it was tuned on, and these are Euler and ER SDE without a few-step LoRA. The defaults come from live tests on MOSS-Image (Euler, 50 steps, SLG End Percent 1.0): about 2.4x fewer transformer calls with an image close to the unaccelerated one. The node's own values are in brackets.
 
 | Control | Default | Description |
 | --- | --- | --- |
@@ -75,20 +89,6 @@ The original's **Spectrum MOSS-Image (Manual)** node: a fixed expanding-window s
 | Real steps while a ControlNet is active | on | |
 
 **ER SDE caps Manual at one forecast in a row,** whatever the slider says, which is where this port departs from the original node. The ER SDE bridge can only extrapolate from two consecutive real steps. After a longer streak it has to reuse the last real result while ER SDE keeps adding noise, and the image ghosts: doubled outlines and translucent duplicate fingers in a live test with 8 in a row. Adaptive already caps itself the same way. With the default warmup of 8, ER SDE at 25 steps runs about 1.5x fewer transformer calls.
-
-### Adaptive
-
-The original's **Spectrum MOSS-Image (Adaptive)** node, with its defaults. At every real step it measures how far the forecast would have been off, on a sample of image tokens (95th and 99th percentile, so a small drifting region such as a hand is not averaged away), and shortens or lengthens the forecast streak.
-
-| Control | Default | Description |
-| --- | --- | --- |
-| Adaptive warmup steps | 8 | First steps that always run the transformer. |
-| Adaptive tail steps | 2 | Last steps that always run the transformer. |
-| Detail guard steps | 8 | After warmup, at most one forecast between real steps. |
-| Post-guard horizon cap | 6 | Longest forecast streak after the guard. ER SDE: 1. |
-| Error tolerance | 1.0 | Forecast error tolerated before backing off. Higher = faster, riskier. |
-| Forecast budget | 2.0 | Starting forecast budget before the next real step (the node's `window_size`). ER SDE: ignored. |
-| Budget growth | 0.5 | How fast the budget grows after good refreshes (the node's `flex_window`). ER SDE: ignored. |
 
 ### Advanced
 

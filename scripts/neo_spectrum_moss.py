@@ -43,9 +43,9 @@ class NeoSpectrumMOSS(scripts.Script):
         #   labels must be unique within the script: `ui-config.json` keys saved defaults
         #   by label, so two "Window size" sliders would share one saved value
         with InputAccordion(False, label=self.title()) as enable:
-            mode = gr.Radio(value=MANUAL, choices=[MANUAL, ADAPTIVE], label="Mode", info="Manual is a fixed schedule; Adaptive measures forecast error at each real step and adjusts")
+            mode = gr.Radio(value=ADAPTIVE, choices=[ADAPTIVE, MANUAL], label="Mode", info="Adaptive measures forecast error at each real step and adjusts, so it suits any sampler or LoRA; Manual is a fixed schedule tuned for Euler and ER SDE")
 
-            with gr.Group(visible=True) as g_manual:
+            with gr.Group(visible=False) as g_manual:
                 with gr.Row():
                     manual_warmup_steps = gr.Slider(minimum=0, maximum=64, value=8, step=1, label="Warmup steps", info="first steps that always run the full transformer; below 8 the layout changes")
                     manual_tail_steps = gr.Slider(minimum=0, maximum=64, value=3, step=1, label="Tail actual steps", info="last steps that always run the full transformer; higher = safer")
@@ -61,7 +61,7 @@ class NeoSpectrumMOSS(scripts.Script):
                     blend_weight = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.01, label="Blend weight", info="0 = linear extrapolation only, 1 = spectral only. ER SDE: ignored")
                 force_actual_on_control = gr.Checkbox(True, label="Real steps while a ControlNet is active")
 
-            with gr.Group(visible=False) as g_adaptive:
+            with gr.Group(visible=True) as g_adaptive:
                 with gr.Row():
                     adaptive_warmup_steps = gr.Slider(minimum=0, maximum=64, value=8, step=1, label="Adaptive warmup steps", info="first steps that always run the full transformer; higher = safer")
                     adaptive_tail_steps = gr.Slider(minimum=0, maximum=16, value=2, step=1, label="Adaptive tail steps", info="last steps that always run the full transformer; higher = safer")
