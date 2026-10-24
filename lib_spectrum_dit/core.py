@@ -1,4 +1,4 @@
-# Neo-Spectrum-MOSS
+# Neo-Spectrum-DiT
 #
 # Scheduler, forecaster and adaptive controller of ComfyUI-Spectrum-MOSS v0.8.0
 # (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS, nodes.py), kept verbatim where it
@@ -20,7 +20,7 @@ from typing import Any, Optional
 import torch
 
 
-logger = logging.getLogger("Spectrum-MOSS")
+logger = logging.getLogger("Spectrum-DiT")
 
 _PREDICT_CHUNK = 1 << 22
 
@@ -509,7 +509,7 @@ def _runtime_config(config: SpectrumConfig, er_sde: bool) -> SpectrumConfig:
     keeps its error/guard logic, but ER-SDE caps the forecast horizon at one and
     therefore ignores its window-growth controls.
 
-    Neo-Spectrum-MOSS departs from the node here: Manual is capped at one
+    Neo-Spectrum-DiT departs from the node here: Manual is capped at one
     forecast in a row as well. The bridge extrapolates only from two adjacent
     real steps; after a longer streak it holds the last real result while ER
     SDE keeps adding noise, which ghosts (seen live on 2026-10-22).

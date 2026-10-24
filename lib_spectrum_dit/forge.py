@@ -1,4 +1,4 @@
-# Neo-Spectrum-MOSS
+# Neo-Spectrum-DiT
 #
 # Forge Neo adapter for the ComfyUI-Spectrum-MOSS v0.8.0 diffusion-model wrapper
 # (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS, nodes.py).
@@ -9,10 +9,11 @@
 
 The node wraps the diffusion model itself; Forge Neo's nearest hook is one level up, around
 `KModel.apply_model` (`backend/sampling/sampling_function.py`, the `model_function_wrapper`
-call). So an actual step calls the model function as usual, with a forward hook on the last
-block, and a forecast step does what `apply_model` would have done around the transformer:
-`predictor.calculate_input`, the MOSS output head on the forecast hidden state at
-`predictor.timestep(sigma)`, then `predictor.calculate_denoised`.
+call). So an actual step calls the model function as usual, with the model adapter's hooks
+capturing the image tokens' hidden state (models.py), and a forecast step does what
+`apply_model` would have done around the transformer: `predictor.calculate_input`, the
+model's output head on the forecast hidden state at `predictor.timestep(sigma)`, then
+`predictor.calculate_denoised`.
 
 The step index comes from `transformer_options["sampling_sigmas"]`, rebased to the first
 sigma this run sees, because img2img and the hires pass publish the full schedule while the
@@ -28,7 +29,6 @@ import torch
 
 from backend import memory_management
 from backend.logging import setup_logger
-from backend.nn import moss_image as moss_nn
 
 from .core import (
     SpectrumBranchState,
@@ -45,20 +45,12 @@ from .core import (
     logger,
 )
 from .er_sde_bridge import ERSDESolverBridge
+from .models import SUPPORTED, adapter_for
 
 setup_logger(logger)
 
-WRAPPER_TAG = "_neo_spectrum_moss"
+WRAPPER_TAG = "_neo_spectrum_dit"
 BUILTIN_SPECTRUM_WRAPPER = "spectrum_unet_wrapper"
-
-
-def is_native_moss(core: Any) -> bool:
-    """Only Forge Neo's own DiT: the forecast head is rebuilt from its functions.
-
-    The older moss-image-forge-neo extension, while installed, loads its own model class;
-    its head is not guaranteed to match, so the wrapper stands down instead of guessing.
-    """
-    return isinstance(core, moss_nn.MOSSImage)
 
 
 def _resolve_cache_target(hidden: torch.Tensor, cache_device: str) -> tuple[torch.device, torch.dtype]:
@@ -72,71 +64,58 @@ def _resolve_cache_target(hidden: torch.Tensor, cache_device: str) -> tuple[torc
     return hidden.device, hidden.dtype
 
 
-def _capture_hooks(core: Any, config: SpectrumConfig, captured: dict) -> list:
-    """Hook the model call and its last block; return the handles.
-
-    The pre-hook records how many image tokens *this* call has, so a caller that splits the
-    latent into tiles cannot have a tile's tokens mistaken for the whole image's; the wrapper
-    then rejects a feature whose shape does not match its own input.
-    """
-
-    def pre_hook(_module: Any, args: tuple, kwargs: dict) -> None:
-        x = args[0] if args else kwargs.get("x")
-        if torch.is_tensor(x) and x.ndim == 4:
-            captured["tokens"] = int(x.shape[-2]) * int(x.shape[-1])
-
-    def last_block_hook(_module: Any, _args: tuple, output: Any) -> None:
-        tokens = captured.get("tokens")
-        if tokens is None or not torch.is_tensor(output) or output.ndim != 3 or output.shape[1] < tokens:
-            return
-        hidden = output[:, :tokens]
-        target_device, target_dtype = _resolve_cache_target(hidden, config.cache_device)
-        # A copy, not a view: the block's residual is updated in place, and a view would
-        # also keep the text tokens of the whole activation alive.
+def _copy_feature(hidden: torch.Tensor, cache_device: str) -> Optional[torch.Tensor]:
+    """A copy, not a view: residual streams are updated in place, and a view would also keep
+    the text tokens of the whole activation alive."""
+    target_device, target_dtype = _resolve_cache_target(hidden, cache_device)
+    try:
+        return hidden.detach().to(
+            device=target_device,
+            dtype=target_dtype,
+            non_blocking=(target_device.type == hidden.device.type),
+            copy=True,
+            memory_format=torch.contiguous_format,
+        )
+    except RuntimeError:
+        # VRAM/offload target failed: prefer a slower CPU anchor to breaking the run.
         try:
-            captured["feature"] = hidden.detach().to(
-                device=target_device,
-                dtype=target_dtype,
-                non_blocking=(target_device.type == hidden.device.type),
-                copy=True,
-                memory_format=torch.contiguous_format,
-            )
+            return hidden.detach().to("cpu", copy=True, memory_format=torch.contiguous_format)
         except RuntimeError:
-            # VRAM/offload target failed: prefer a slower CPU anchor to breaking the run.
-            try:
-                captured["feature"] = hidden.detach().to("cpu", copy=True, memory_format=torch.contiguous_format)
-            except RuntimeError:
-                return
-
-    return [
-        core.register_forward_pre_hook(pre_hook, with_kwargs=True),
-        core.layers[-1].register_forward_hook(last_block_hook),
-    ]
+            return None
 
 
-def run_moss_head(core: Any, x: torch.Tensor, timestep: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
-    """MOSS' timestep-conditioned output head on a last-block state.
+def _capture_hooks(adapter: Any, core: Any, config: SpectrumConfig, captured: dict) -> list:
+    """Install the adapter's hooks; each piece of hidden state they hand over is copied into
+    `captured["pieces"]`. Return the handles."""
+    pieces = captured.setdefault("pieces", [])
 
-    The last lines of `backend/nn/moss_image.py::MOSSImage.forward`, through the same module
-    functions, so a quantized or offloaded head casts its weights the way the model does.
-    """
-    dtype = x.dtype
-    device = x.device
-    batch, _, height, width = x.shape
+    def store(hidden: torch.Tensor) -> None:
+        copied = _copy_feature(hidden, config.cache_device)
+        if copied is not None:
+            pieces.append(copied)
 
-    hidden = feature.to(device=device, dtype=dtype, non_blocking=(feature.device.type == device.type))
-    vec = core.time_embedding(moss_nn.timestep_embedding(timestep, 256).to(dtype))
-    head_shift, head_scale = core.video_head_modulation(vec).unflatten(-1, (2, -1)).unsqueeze(2).unbind(1)
-    out = core.final_linear_video(moss_nn.modulated_rms_norm(hidden, core.final_norm_video, head_scale, head_shift))
-    return out.transpose(1, 2).reshape(batch, int(core.latent_channels), height, width)
+    return adapter.hooks(core, store)
 
 
-def forecast_denoised(kmodel: Any, core: Any, x: torch.Tensor, sigma: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
+def _captured_feature(captured: dict) -> Optional[torch.Tensor]:
+    """The call's hidden state: one piece, or the per-sample pieces joined along the batch."""
+    pieces = captured.get("pieces") or []
+    if not pieces:
+        return None
+    if len(pieces) == 1:
+        return pieces[0]
+    try:
+        return torch.cat([p.to(pieces[0].device) for p in pieces], dim=0)
+    except RuntimeError:
+        return None
+
+
+def forecast_denoised(kmodel: Any, adapter: Any, core: Any, x: torch.Tensor, sigma: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
     """`KModel.apply_model` (`backend/modules/k_model.py`) with the transformer replaced by the head."""
     predictor = kmodel.predictor
     xc = predictor.calculate_input(sigma, x).to(kmodel.computation_dtype)
     t = predictor.timestep(sigma).float()
-    model_output = run_moss_head(core, xc, t, feature).float()
+    model_output = adapter.head(core, xc, t, feature).float()
     return predictor.calculate_denoised(sigma, model_output, x)
 
 
@@ -149,9 +128,11 @@ class RunReport:
     forecast_calls: int = 0
     branches: int = 0
     decisions: list = None
+    model: str = ""
 
 
 def make_wrapper(
+    adapter: Any,
     core: Any,
     kmodel: Any,
     config: SpectrumConfig,
@@ -174,14 +155,14 @@ def make_wrapper(
     def run_actual(model_function, kwargs, branch: SpectrumBranchState, reason, step_index, total_steps, coord, branch_key, x) -> torch.Tensor:
         runtime_config = branch.config
         captured: dict = {}
-        handles = _capture_hooks(core, runtime_config, captured)
+        handles = _capture_hooks(adapter, core, runtime_config, captured)
         try:
             out = call_model(model_function, kwargs)
         finally:
             for handle in handles:
                 handle.remove()
 
-        feature = captured.get("feature")
+        feature = _captured_feature(captured)
         image_tokens = int(x.shape[-2]) * int(x.shape[-1])
         if feature is not None and (feature.ndim != 3 or int(feature.shape[0]) != int(x.shape[0]) or int(feature.shape[1]) != image_tokens):
             _log_debug(runtime_config.debug, f"captured feature {tuple(feature.shape)} does not match the input; staying on real steps")
@@ -207,7 +188,7 @@ def make_wrapper(
                 except ValueError:
                     _log_warning("could not record last-block hidden state after reset")
         else:
-            _log_debug(runtime_config.debug, "last-block hook did not capture a feature; staying on real steps")
+            _log_debug(runtime_config.debug, "the hidden-state hook captured nothing; staying on real steps")
 
         _log_debug(
             runtime_config.debug,
@@ -224,7 +205,7 @@ def make_wrapper(
     def run_forecast(branch: SpectrumBranchState, step_index, total_steps, coord, branch_key, x, sigma) -> torch.Tensor:
         runtime_config = branch.config
         feature = branch.forecaster.predict(coord)
-        out = forecast_denoised(kmodel, core, x, sigma, feature)
+        out = forecast_denoised(kmodel, adapter, core, x, sigma, feature)
         _log_debug(
             runtime_config.debug,
             f"step {step_index + 1}/{total_steps} branch={branch_key} "
@@ -235,7 +216,7 @@ def make_wrapper(
         )
         return out
 
-    def spectrum_moss_wrapper(model_function: Callable, kwargs: dict) -> torch.Tensor:
+    def spectrum_dit_wrapper(model_function: Callable, kwargs: dict) -> torch.Tensor:
         x = kwargs["input"]
         sigma = kwargs["timestep"]
         c = kwargs.get("c") or {}
@@ -272,7 +253,12 @@ def make_wrapper(
 
         cond_key = tuple(transformer_options.get("cond_or_uncond") or kwargs.get("cond_or_uncond") or ())
         patch_key = _patch_signature(transformer_options)
-        branch_key = (cond_key, patch_key)
+        # a model-specific part, such as FIBO 2's text phase: a new history where it changes
+        try:
+            model_key = tuple(adapter.branch_key(core, c, sigma))
+        except Exception:
+            model_key = ()
+        branch_key = (cond_key, patch_key) + ((model_key,) if model_key else ())
         branch = root.branch(branch_key)
         runtime_config = branch.config
 
@@ -316,7 +302,7 @@ def make_wrapper(
             if live <= root.completed_branches and not root.summary_logged:
                 actual_calls = sum(b.actual_count for b in root.branches.values())
                 forecast_calls = sum(b.forecast_count for b in root.branches.values())
-                report = RunReport(total_steps, actual_calls, forecast_calls, len(root.branches), list(decisions))
+                report = RunReport(total_steps, actual_calls, forecast_calls, len(root.branches), list(decisions), adapter.name)
                 if runtime_config.debug:
                     total_calls = actual_calls + forecast_calls
                     ratio = (float(total_calls) / float(actual_calls)) if actual_calls else 0.0
@@ -333,17 +319,17 @@ def make_wrapper(
 
         return out
 
-    setattr(spectrum_moss_wrapper, WRAPPER_TAG, True)
-    spectrum_moss_wrapper.root_state = root  # type: ignore[attr-defined]
-    spectrum_moss_wrapper.bridge = bridge  # type: ignore[attr-defined]
+    setattr(spectrum_dit_wrapper, WRAPPER_TAG, True)
+    spectrum_dit_wrapper.root_state = root  # type: ignore[attr-defined]
+    spectrum_dit_wrapper.bridge = bridge  # type: ignore[attr-defined]
 
     def release() -> None:
         for b in root.branches.values():
             b.forecaster.release_features()
         bridge.release()
 
-    spectrum_moss_wrapper.release = release  # type: ignore[attr-defined]
-    return spectrum_moss_wrapper
+    spectrum_dit_wrapper.release = release  # type: ignore[attr-defined]
+    return spectrum_dit_wrapper
 
 
 def er_sde_lambdas_fn(predictor: Any) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -360,8 +346,9 @@ def install(unet: Any, config: SpectrumConfig, *, sampler_name: str, brownian_no
     """Clone `unet` and install Spectrum on it; `(None, reason)` when it must stand down."""
     config.validate()
     core = unet.get_model_object("diffusion_model")
-    if not is_native_moss(core):
-        return None, "the loaded model is not Forge Neo's native MOSS-Image"
+    adapter = adapter_for(core)
+    if adapter is None:
+        return None, f"the loaded model is not {SUPPORTED}"
 
     previous = unet.model_options.get("model_function_wrapper")
     if previous is not None and getattr(previous, "__name__", "") == BUILTIN_SPECTRUM_WRAPPER:
@@ -376,7 +363,8 @@ def install(unet: Any, config: SpectrumConfig, *, sampler_name: str, brownian_no
         bridge.force_bypass("ER-SDE with a custom noise sampler is not bridged; using actual steps.")
 
     clone = unet.clone()
-    wrapper = make_wrapper(core, clone.model, config, bridge, previous, on_run_complete)
+    wrapper = make_wrapper(adapter, core, clone.model, config, bridge, previous, on_run_complete)
+    wrapper.model_name = adapter.name  # type: ignore[attr-defined]
     wrapper._previous = previous  # type: ignore[attr-defined]
     clone.set_model_unet_function_wrapper(wrapper)
     if er_sde and not bridge.bypass_spectrum:

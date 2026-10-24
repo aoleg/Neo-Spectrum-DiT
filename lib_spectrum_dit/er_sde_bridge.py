@@ -1,4 +1,4 @@
-# Neo-Spectrum-MOSS
+# Neo-Spectrum-DiT
 #
 # ER-SDE solver-space bridge of ComfyUI-Spectrum-MOSS v0.8.0
 # (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS, er_sde_bridge.py), ported to Forge Neo.
@@ -31,7 +31,7 @@ from typing import Any, Callable, Optional
 import torch
 
 
-logger = logging.getLogger("Spectrum-MOSS")
+logger = logging.getLogger("Spectrum-DiT")
 
 SUPPORTED_ER_SDE_SAMPLER = "sample_er_sde"
 VERIFIED_SAMPLERS = frozenset({"sample_euler", "sample_er_sde"})

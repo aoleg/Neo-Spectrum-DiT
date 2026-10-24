@@ -1,20 +1,22 @@
-# Neo-Spectrum-MOSS
+# Neo-Spectrum-DiT
 #
 # SPDX-License-Identifier: GPL-3.0-only
 
 """
-Spectrum for MOSS-Image in WebUI Forge Neo: a port of Rkkss' ComfyUI-Spectrum-MOSS v0.8.0
-(https://github.com/Rkkss/ComfyUI-Spectrum-MOSS).
+Spectrum for MOSS-Image and FIBO 2 in WebUI Forge Neo: a port of Rkkss' ComfyUI-Spectrum-MOSS
+v0.8.0 (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS), extended to FIBO 2 (the
+fibo2-forge-neo extension) through a per-model adapter (lib_spectrum_dit/models.py).
 
 Unlike the built-in "Spectrum Integrated", which forecasts the model's whole output, this
-forecasts MOSS-Image's last-block hidden state and runs the real timestep-conditioned output
-head on it. The two nodes of the original (Manual and Adaptive) are one Mode switch here.
+forecasts the image tokens' hidden state before the output head and runs the real
+timestep-conditioned head on it. The two nodes of the original (Manual and Adaptive) are one
+Mode switch here.
 """
 
 import gradio as gr
 
-from lib_spectrum_moss import core
-from lib_spectrum_moss.forge import install, logger
+from lib_spectrum_dit import core
+from lib_spectrum_dit.forge import install, logger
 
 from modules import scripts
 from modules.ui_components import InputAccordion
@@ -22,9 +24,11 @@ from modules.ui_components import InputAccordion
 MANUAL = "Manual"
 ADAPTIVE = "Adaptive"
 CACHE_DEVICES = ["main_device", "offload_device", "cpu"]
+# the infotext prefix of versions before the rename to Neo-Spectrum-DiT
+LEGACY_PREFIX = "Spectrum MOSS"
 
 
-class NeoSpectrumMOSS(scripts.Script):
+class NeoSpectrumDiT(scripts.Script):
     # after the built-in Spectrum (2026), so its wrapper is already in place to be detected
     sorting_priority = 2027
 
@@ -34,7 +38,7 @@ class NeoSpectrumMOSS(scripts.Script):
     wrappers: list = []
 
     def title(self):
-        return "Spectrum MOSS-Image"
+        return "Spectrum DiT"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
@@ -90,26 +94,33 @@ class NeoSpectrumMOSS(scripts.Script):
         )
 
         self.infotext_fields = [
-            (enable, lambda d: "Spectrum MOSS mode" in d),
-            (mode, "Spectrum MOSS mode"),
+            (enable, lambda d: "Spectrum DiT mode" in d or LEGACY_PREFIX + " mode" in d),
+            (mode, "Spectrum DiT mode"),
             #   one infotext key per pair of sliders: the restored mode picks which one counts
-            (manual_warmup_steps, "Spectrum MOSS warmup"),
-            (adaptive_warmup_steps, "Spectrum MOSS warmup"),
-            (manual_tail_steps, "Spectrum MOSS tail"),
-            (adaptive_tail_steps, "Spectrum MOSS tail"),
-            (detail_guard_steps, "Spectrum MOSS detail guard"),
-            (post_guard_horizon_cap, "Spectrum MOSS horizon cap"),
-            (adaptive_window_size, "Spectrum MOSS adaptive window"),
-            (adaptive_flex_window, "Spectrum MOSS adaptive growth"),
-            (error_tolerance, "Spectrum MOSS error tolerance"),
-            (manual_window_size, "Spectrum MOSS window"),
-            (manual_flex_window, "Spectrum MOSS growth"),
-            (max_consecutive_forecasts, "Spectrum MOSS max forecasts"),
-            (history_points, "Spectrum MOSS history"),
-            (chebyshev_degree, "Spectrum MOSS degree"),
-            (ridge_lambda, "Spectrum MOSS ridge"),
-            (blend_weight, "Spectrum MOSS blend"),
-            (force_actual_on_control, "Spectrum MOSS real on control"),
+            (manual_warmup_steps, "Spectrum DiT warmup"),
+            (adaptive_warmup_steps, "Spectrum DiT warmup"),
+            (manual_tail_steps, "Spectrum DiT tail"),
+            (adaptive_tail_steps, "Spectrum DiT tail"),
+            (detail_guard_steps, "Spectrum DiT detail guard"),
+            (post_guard_horizon_cap, "Spectrum DiT horizon cap"),
+            (adaptive_window_size, "Spectrum DiT adaptive window"),
+            (adaptive_flex_window, "Spectrum DiT adaptive growth"),
+            (error_tolerance, "Spectrum DiT error tolerance"),
+            (manual_window_size, "Spectrum DiT window"),
+            (manual_flex_window, "Spectrum DiT growth"),
+            (max_consecutive_forecasts, "Spectrum DiT max forecasts"),
+            (history_points, "Spectrum DiT history"),
+            (chebyshev_degree, "Spectrum DiT degree"),
+            (ridge_lambda, "Spectrum DiT ridge"),
+            (blend_weight, "Spectrum DiT blend"),
+            (force_actual_on_control, "Spectrum DiT real on control"),
+        ]
+        #   pictures made before the rename carry "Spectrum MOSS ..." keys; a missing key is
+        #   skipped, so listing both restores either
+        self.infotext_fields += [
+            (component, LEGACY_PREFIX + key.removeprefix("Spectrum DiT"))
+            for component, key in self.infotext_fields
+            if isinstance(key, str)
         ]
 
         return [
@@ -162,14 +173,14 @@ class NeoSpectrumMOSS(scripts.Script):
                 debug=bool(debug),
             )
             params = {
-                "Spectrum MOSS window": config.window_size,
-                "Spectrum MOSS growth": config.flex_window,
-                "Spectrum MOSS max forecasts": config.max_consecutive_forecasts,
-                "Spectrum MOSS history": config.history_points,
-                "Spectrum MOSS degree": config.chebyshev_degree,
-                "Spectrum MOSS ridge": config.ridge_lambda,
-                "Spectrum MOSS blend": config.blend_weight,
-                "Spectrum MOSS real on control": config.force_actual_on_control,
+                "Spectrum DiT window": config.window_size,
+                "Spectrum DiT growth": config.flex_window,
+                "Spectrum DiT max forecasts": config.max_consecutive_forecasts,
+                "Spectrum DiT history": config.history_points,
+                "Spectrum DiT degree": config.chebyshev_degree,
+                "Spectrum DiT ridge": config.ridge_lambda,
+                "Spectrum DiT blend": config.blend_weight,
+                "Spectrum DiT real on control": config.force_actual_on_control,
             }
         else:
             config = core.SpectrumConfig(
@@ -190,23 +201,23 @@ class NeoSpectrumMOSS(scripts.Script):
                 debug=bool(debug),
             )
             params = {
-                "Spectrum MOSS detail guard": config.detail_guard_steps,
-                "Spectrum MOSS horizon cap": config.post_guard_horizon_cap,
-                "Spectrum MOSS adaptive window": config.window_size,
-                "Spectrum MOSS adaptive growth": config.flex_window,
-                "Spectrum MOSS error tolerance": config.error_tolerance,
+                "Spectrum DiT detail guard": config.detail_guard_steps,
+                "Spectrum DiT horizon cap": config.post_guard_horizon_cap,
+                "Spectrum DiT adaptive window": config.window_size,
+                "Spectrum DiT adaptive growth": config.flex_window,
+                "Spectrum DiT error tolerance": config.error_tolerance,
             }
 
         params = {
-            "Spectrum MOSS mode": MANUAL if config.mode == "manual" else ADAPTIVE,
-            "Spectrum MOSS warmup": config.warmup_steps,
-            "Spectrum MOSS tail": config.tail_actual_steps,
+            "Spectrum DiT mode": MANUAL if config.mode == "manual" else ADAPTIVE,
+            "Spectrum DiT warmup": config.warmup_steps,
+            "Spectrum DiT tail": config.tail_actual_steps,
             **params,
         }
         return config, params
 
     def process(self, p, enable, *args):
-        cls = NeoSpectrumMOSS
+        cls = NeoSpectrumDiT
         cls.release_all()
         cls.reports = []
 
@@ -222,7 +233,7 @@ class NeoSpectrumMOSS(scripts.Script):
             config, params = self.make_config(mode, *args[:-4], args[-4], debug)
             config.validate()
         except Exception as exc:
-            logger.error(f"Spectrum MOSS: invalid settings ({exc}); standing down")
+            logger.error(f"Spectrum DiT: invalid settings ({exc}); standing down")
             return
 
         sampler = getattr(p, "sampler", None)
@@ -230,27 +241,27 @@ class NeoSpectrumMOSS(scripts.Script):
         sampler_name = str(getattr(func, "__name__", type(sampler).__name__))
         options = getattr(getattr(sampler, "config", None), "options", None) or {}
         if warn_unverified_sampler and sampler_name not in {"sample_euler", "sample_er_sde"}:
-            logger.warning(f"Spectrum MOSS: unverified sampler {sampler_name}; the forecasts were validated with Euler and ER SDE")
+            logger.warning(f"Spectrum DiT: unverified sampler {sampler_name}; the forecasts were validated with Euler and ER SDE")
 
         unet = p.sd_model.forge_objects.unet
-        patched, how = install(unet, config, sampler_name=sampler_name, brownian_noise=bool(options.get("brownian_noise", False)), on_run_complete=NeoSpectrumMOSS.reports.append)
+        patched, how = install(unet, config, sampler_name=sampler_name, brownian_noise=bool(options.get("brownian_noise", False)), on_run_complete=NeoSpectrumDiT.reports.append)
         if patched is None:
-            logger.warning(f"Spectrum MOSS: standing down, {how}")
+            logger.warning(f"Spectrum DiT: standing down, {how}")
             return
 
-        NeoSpectrumMOSS.wrappers.append(patched.model_options["model_function_wrapper"])
+        NeoSpectrumDiT.wrappers.append(patched.model_options["model_function_wrapper"])
         p.sd_model.forge_objects.unet = patched
         p.extra_generation_params.update(params)
         if how == "er_sde":
             capped = config.mode == "manual" and config.max_consecutive_forecasts > 1
-            logger.info("Spectrum MOSS: ER SDE detected, forecasts go through the solver-space bridge" + (", at most 1 in a row" if capped else ""))
+            logger.info("Spectrum DiT: ER SDE detected, forecasts go through the solver-space bridge" + (", at most 1 in a row" if capped else ""))
 
     def postprocess(self, p, processed, *args):
-        cls = NeoSpectrumMOSS
+        cls = NeoSpectrumDiT
         for report in cls.reports:
             calls = report.actual_calls + report.forecast_calls
             if report.actual_calls:
-                logger.info(f"Spectrum MOSS: {report.total_steps} steps, {report.actual_calls} of {calls} transformer calls run ({calls / report.actual_calls:.2f}x fewer)")
+                logger.info(f"Spectrum DiT: {report.model}, {report.total_steps} steps, {report.actual_calls} of {calls} transformer calls run ({calls / report.actual_calls:.2f}x fewer)")
         cls.reports = []
         cls.release_all()
 
