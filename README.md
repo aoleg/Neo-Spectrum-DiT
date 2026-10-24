@@ -2,14 +2,14 @@
 
 A **Forge Neo** extension that skips transformer evaluations on **MOSS-Image** and **FIBO 2** by forecasting them. It is a port of [Rkkss/ComfyUI-Spectrum-MOSS](https://github.com/Rkkss/ComfyUI-Spectrum-MOSS) v0.8.0 (MOSS-Image), extended to FIBO 2.
 
-On a forecast step the transformer does not run. The extension predicts the image tokens' hidden state as it enters the model's output head, from the real steps before it (a ridge-regularised Chebyshev fit blended with linear extrapolation), and runs only that small, timestep-conditioned head on the prediction. On MOSS-Image this runs about 2x fewer transformer calls in Adaptive mode, with an image close to the unaccelerated one.
+On a forecast step the transformer does not run. The extension predicts the image tokens' hidden state as it enters the model's output head, from the real steps before it (a ridge-regularised Chebyshev fit blended with linear extrapolation), and runs only that small, timestep-conditioned head on the prediction. In Adaptive mode this runs about 2x fewer transformer calls on MOSS-Image and about 1.5x fewer on FIBO 2, with a picture close to the unaccelerated one.
 
 ## Supported models
 
 | Model | Needs | Status |
 | --- | --- | --- |
 | MOSS-Image | Forge Neo with native MOSS-Image support (be6fa5d4, 2026-10-21, or later) | Tested live; the examples below |
-| FIBO 2 | the [fibo2-forge-neo](https://github.com/eduardoabreu81/fibo2-forge-neo) extension | Checked on CPU against the real model code; not yet tested live |
+| FIBO 2 | the [fibo2-forge-neo](https://github.com/eduardoabreu81/fibo2-forge-neo) extension | Tested live: Adaptive, Euler and ER SDE; results below |
 
 On any other model the extension stands down and says so in the console.
 
@@ -57,6 +57,15 @@ While the older `moss-image-forge-neo` extension is installed, its model loader 
 - **Use Adaptive.** Manual's defaults were tuned on MOSS-Image.
 - **Text pictures.** When a caption has `text_render` entries, FIBO 2 switches to a second text conditioning at sigma 0.9 (about step 13 of 50 at 1024x1024). The hidden state jumps there, so Spectrum starts a fresh forecast history at the switch and runs a few real steps to rebuild it.
 - **Edits** work as usual: the reference images do not reach the output head, so they do not change what is forecast.
+
+First live results: FIBO 2 Dev (int8), 1728x1280, CFG 5, Beta schedule, one group-photo prompt, Adaptive with its defaults. "Calls" counts cond and uncond separately.
+
+| Sampler | Transformer calls run | Sampling time | Speedup |
+| --- | --- | --- | --- |
+| Euler, 50 steps | 67 of 100 | 46 s → 32 s | 1.44x |
+| ER SDE, 25 steps | 34 of 50 | 23 s → 17 s | 1.35x |
+
+The composition, the background and the sharpness stay as in the unaccelerated picture, with no ghosting. What changes is small detail that is still being decided late, such as individual faces in a crowd. Adaptive backs off sooner on FIBO 2 than on MOSS-Image (about 1.5x fewer calls against about 2x), so FIBO 2's hidden state is harder to forecast at these settings. A longer tail (4 instead of 2) made no difference; a RES4LYF radau_ia_2s run at 15 steps came out almost identical to its baseline.
 
 ## Examples
 
