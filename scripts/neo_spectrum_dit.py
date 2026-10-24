@@ -83,7 +83,7 @@ class NeoSpectrumDiT(scripts.Script):
                     cache_device = gr.Dropdown(value="main_device", choices=CACHE_DEVICES, label="Cache device", info="where the hidden-state history lives; main_device is fastest but uses VRAM")
                     apply_to_hr = gr.Checkbox(True, label="Apply to the Hires. fix pass")
                 with gr.Row():
-                    warn_unverified_sampler = gr.Checkbox(True, label="Warn on unverified samplers", info="Euler and ER SDE are verified; the warning changes nothing")
+                    warn_unverified_sampler = gr.Checkbox(True, label="Warn on unverified samplers", info="every sampler runs with forecasts; the console notes when quality was not checked with it; changes nothing else")
                     debug = gr.Checkbox(False, label="Debug log", info="every decision, forecast error and the final counts in the console")
 
         mode.change(
@@ -241,7 +241,7 @@ class NeoSpectrumDiT(scripts.Script):
         sampler_name = str(getattr(func, "__name__", type(sampler).__name__))
         options = getattr(getattr(sampler, "config", None), "options", None) or {}
         if warn_unverified_sampler and sampler_name not in {"sample_euler", "sample_er_sde"}:
-            logger.warning(f"Spectrum DiT: unverified sampler {sampler_name}; the forecasts were validated with Euler and ER SDE")
+            logger.warning(f"Spectrum DiT: {sampler_name} runs with forecasts, but image quality was only checked with Euler and ER SDE")
 
         unet = p.sd_model.forge_objects.unet
         patched, how = install(unet, config, sampler_name=sampler_name, brownian_noise=bool(options.get("brownian_noise", False)), on_run_complete=NeoSpectrumDiT.reports.append)

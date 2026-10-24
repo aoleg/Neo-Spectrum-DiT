@@ -23,6 +23,7 @@ sampler runs only its tail.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Callable, Optional
 
 import torch
@@ -36,10 +37,8 @@ from .core import (
     SpectrumRootState,
     _adaptive_validate_and_update,
     _choose_actual,
-    _find_step_index,
     _log_debug,
     _log_warning,
-    _normalize_step_position,
     _note_decision,
     _patch_signature,
     logger,
@@ -119,6 +118,47 @@ def forecast_denoised(kmodel: Any, adapter: Any, core: Any, x: torch.Tensor, sig
     return predictor.calculate_denoised(sigma, model_output, x)
 
 
+# A call this close to a schedule sigma, as a fraction of its step, is on that step: ER SDE's
+# first call comes at a sigma nudged below 1 (offset_first_sigma_for_snr).
+_SNAP = 0.01
+
+
+def _step_position(values: list[float], sigma: torch.Tensor) -> float:
+    """Where a model call sits in a descending schedule, in steps: i + fraction for a sigma
+    between values[i] and values[i + 1].
+
+    Sub-step samplers (Heun's corrector, DPM++ 2S, RES4LYF's res_2s, radau, gauss-legendre)
+    call the model between schedule sigmas; such a call belongs to the step it is inside.
+    The node's lookup tries sigma and sigma / 1000 and keeps the nearer: off the schedule,
+    sigma / 1000 lands next to the final 0, so a sub-step looked like the last step and the
+    next call like a new run, which wiped the history every step.
+    """
+    v = float(sigma.reshape(-1)[0])
+    last = len(values) - 1
+    if v >= values[0]:
+        return 0.0
+    if v <= values[last]:
+        return float(last)
+    i = 0
+    while i < last - 1 and values[i + 1] > v:
+        i += 1
+    hi, lo = values[i], values[i + 1]
+    fraction = (hi - v) / (hi - lo) if hi > lo else 0.0
+    if fraction < _SNAP:
+        return float(i)
+    if fraction > 1.0 - _SNAP:
+        return float(i + 1)
+    return i + fraction
+
+
+def _coordinate(position: float, total_steps: int) -> float:
+    """The node's `_normalize_step_position`, for a fractional step."""
+    if total_steps <= 1:
+        return 0.0
+    coord = 2.0 * position / float(total_steps - 1) - 1.0
+    return max(-1.0, min(1.0, coord))
+
+
 @dataclass
 class RunReport:
     """What the last finished run did, for the one console line and the tests."""
@@ -141,7 +181,10 @@ def make_wrapper(
     on_run_complete: Optional[Callable[[RunReport], None]] = None,
 ):
     root = SpectrumRootState(config, er_sde=bridge.bridge_enabled)
-    decisions: list = []
+    # this run's decisions and report (the report keeps counting the calls after it is made:
+    # a sub-step sampler calls the model again within the final step), the furthest position
+    # reached, and the schedule as floats
+    run: dict = {"decisions": [], "report": None, "max_pos": None, "sigmas_id": None, "values": None}
     # Last step each branch was called at. The node waits for *every* branch to reach the
     # final step, which never happens when SLG ends early (Forge Neo's default range is
     # 0 to 0.5): its branches stop at the midpoint, so the anchors were never released.
@@ -228,27 +271,33 @@ def make_wrapper(
         if not isinstance(sigmas, torch.Tensor) or sigmas.numel() < 2 or not torch.is_tensor(x) or x.ndim != 4:
             return call_model(model_function, kwargs)
 
-        raw_index = _find_step_index(sigmas, sigma)
+        if run["sigmas_id"] != id(sigmas) or run["values"] is None or len(run["values"]) != int(sigmas.numel()):
+            run["values"] = [float(v) for v in sigmas.detach().float().cpu()]
+            run["sigmas_id"] = id(sigmas)
+        position = _step_position(run["values"], sigma)
+        raw_index = int(math.floor(position))
 
-        # New-run detection, on the index into the published schedule. The schedule tensor
-        # is normally new per sampling pass; a backwards step also catches a reused one.
+        # New-run detection, on the position in the published schedule. The schedule tensor
+        # is normally new per sampling pass; a jump back by more than a step also catches a
+        # reused one. Implicit samplers step back within a step, which is not a new run.
         if (
             (root.last_sigmas_id is not None and root.last_sigmas_id != id(sigmas))
             or (root.last_total_steps is not None and root.last_total_steps != int(sigmas.numel()) - 1)
-            or (root.last_step_index is not None and raw_index >= 0 and raw_index < root.last_step_index)
+            or (run["max_pos"] is not None and position < run["max_pos"] - 1.0 - 1e-6)
         ):
             root.reset_run()
-            decisions.clear()
             last_seen.clear()
+            run.update(decisions=[], report=None, max_pos=None)
+        run["max_pos"] = position if run["max_pos"] is None else max(run["max_pos"], position)
 
         if root.step_offset is None:
-            root.step_offset = max(0, raw_index)
+            root.step_offset = raw_index
             bridge.set_schedule(sigmas[root.step_offset :])
 
         if bridge.bypass_spectrum:
             return call_model(model_function, kwargs)
 
-        step_index = raw_index - root.step_offset if raw_index >= 0 else -1
+        step_index = raw_index - root.step_offset
         total_steps = max(1, int(sigmas.numel()) - 1 - root.step_offset)
 
         cond_key = tuple(transformer_options.get("cond_or_uncond") or kwargs.get("cond_or_uncond") or ())
@@ -269,7 +318,7 @@ def make_wrapper(
 
         control_present = c.get("control") is not None or transformer_options.get("control") is not None
         actual, reason = _choose_actual(branch, step_index, total_steps, control_present, runtime_config)
-        coord = _normalize_step_position(step_index, total_steps)
+        coord = _coordinate(position - root.step_offset, total_steps)
 
         try:
             if actual:
@@ -285,7 +334,7 @@ def make_wrapper(
                     out = run_actual(model_function, kwargs, branch, reason, step_index, total_steps, coord, branch_key, x)
         finally:
             _note_decision(branch, actual, reason, runtime_config)
-            decisions.append((step_index, branch_key, actual, reason))
+            run["decisions"].append((step_index, branch_key, actual, reason))
             last_seen[branch_key] = step_index
             try:
                 bridge.note_branch_decision(step_index, total_steps, actual, reason, branch_key)
@@ -302,7 +351,8 @@ def make_wrapper(
             if live <= root.completed_branches and not root.summary_logged:
                 actual_calls = sum(b.actual_count for b in root.branches.values())
                 forecast_calls = sum(b.forecast_count for b in root.branches.values())
-                report = RunReport(total_steps, actual_calls, forecast_calls, len(root.branches), list(decisions), adapter.name)
+                report = RunReport(total_steps, actual_calls, forecast_calls, len(root.branches), run["decisions"], adapter.name)
+                run["report"] = report
                 if runtime_config.debug:
                     total_calls = actual_calls + forecast_calls
                     ratio = (float(total_calls) / float(actual_calls)) if actual_calls else 0.0
@@ -316,6 +366,10 @@ def make_wrapper(
                     b.forecaster.release_features()
                 if on_run_complete is not None:
                     on_run_complete(report)
+        if run["report"] is not None:
+            run["report"].actual_calls = sum(b.actual_count for b in root.branches.values())
+            run["report"].forecast_calls = sum(b.forecast_count for b in root.branches.values())
+            run["report"].branches = len(root.branches)
 
         return out
 

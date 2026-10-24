@@ -31,7 +31,13 @@ Or clone into your Forge Neo `extensions` folder and restart. No extra dependenc
 
 Open the **Spectrum DiT** accordion, tick it, and generate. The console reports how many transformer calls ran, for example `Spectrum DiT: MOSS-Image, 50 steps, 51 of 100 transformer calls run (1.96x fewer)` (cond and uncond count separately).
 
-Other samplers than Euler and ER SDE run, but only those two were validated; the console warns once per pass (Advanced → Warn on unverified samplers turns that off). ER SDE is detected and goes through the solver bridge automatically.
+### Samplers
+
+Every k-diffusion sampler runs with forecasts, including those that call the model more than once per step: Heun, DPM++ 2S and the RES4LYF samplers of [sd-forge-extra-samplers](https://github.com/aoleg/sd-forge-extra-samplers) (res_2s, res_2m, the radau, gauss-legendre and other implicit tableaus). A call between two schedule sigmas belongs to the step it falls in, and its hidden state enters the forecast history at its own position in that step.
+
+- Warmup and tail count **steps**. Max consecutive forecasts and Adaptive's horizon count **model calls**, so with a 2-stage sampler "3 in a row" spans about a step and a half.
+- **ER SDE** is detected and goes through the solver bridge automatically.
+- Image quality was checked live with Euler and ER SDE on MOSS-Image. With any other sampler the console says so once per pass (Advanced → Warn on unverified samplers turns that off); nothing else changes. Adaptive is the safer mode there.
 
 ### MOSS-Image
 
@@ -124,7 +130,7 @@ The scheduler, the forecaster and the adaptive controller (`lib_spectrum_dit/cor
 
 - **Model adapters** (`lib_spectrum_dit/models.py`). Per model: how to recognise it, where to capture the image tokens' hidden state (MOSS-Image: the last block's output; FIBO 2: the final layer's input, past the text "gist" tokens), how to run its output head on a forecast, and what starts a new forecast history (FIBO 2's text phase). FIBO 2 is recognised by its class name, so the extension does not depend on the fibo2-forge-neo extension being installed or loaded first.
 - **Hook.** The node wraps the diffusion model; Forge Neo's nearest hook is the `model_function_wrapper` around `KModel.apply_model`. A forecast step reproduces what `apply_model` does around the transformer: `calculate_input`, the head at `predictor.timestep(sigma)`, `calculate_denoised`. Another extension's wrapper already in that slot is chained, not replaced, and sees only the real steps.
-- **Step index.** It comes from `transformer_options["sampling_sigmas"]`, rebased to the first sigma of the run: for img2img and the hires pass Forge publishes the full schedule while the sampler runs only its tail, so without the rebase warmup and the detail guard would be skipped.
+- **Step index.** It comes from `transformer_options["sampling_sigmas"]`, rebased to the first sigma of the run: for img2img and the hires pass Forge publishes the full schedule while the sampler runs only its tail, so without the rebase warmup and the detail guard would be skipped. Each call gets a fractional position from where its sigma falls between two schedule sigmas. The node instead matched sigma and sigma / 1000 against the schedule, and for a call between two sigmas sigma / 1000 matched the final 0: a sub-step sampler's call looked like the last step, the next one like a new run, and the history was wiped every step, so those samplers never forecast.
 - **ER SDE.** The node copies ComfyUI's sampler only to capture ER SDE's lambda coordinates. Forge Neo's `sample_er_sde` computes them from the sigmas, so the bridge computes the same values up front and never touches the sampler; the guided result reaches it through a post-CFG function.
 - **Release with partial SLG.** The node frees its stored hidden states only after every call pattern reaches the last step, which never happens when SLG ends at the midpoint. The port frees them once every pattern still running near the end has finished.
 
