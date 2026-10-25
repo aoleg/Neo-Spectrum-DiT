@@ -69,15 +69,15 @@ The composition, the background and the sharpness stay as in the unaccelerated p
 
 ## Examples
 
-MOSS-Image Base (int8), 1024x1024, CFG 4.5, seed 42, one prompt with text and floury hands. "Calls" counts cond and uncond separately.
+MOSS-Image Base (int8), seed 42, one prompt with text and floury hands; 1024x1024 at CFG 4.5 unless a sheet's title says otherwise. "Calls" counts cond and uncond separately.
 
 With the Manual defaults, Euler runs 42 of 100 transformer calls and the image stays close to the unaccelerated one, down to the flour on the fingers. A shorter warmup is faster but moves the layout.
 
 ![Euler 50 steps: no Spectrum, Manual default, warmup 6](img/euler_manual.jpg)
 
-Under ER SDE, at most one forecast in a row (the limit before the ER SDE update described under Modes) ran 34 of 50 calls. Warmup decides the layout here too.
+ER SDE with Adaptive at 1536x1536, 30 steps. With Skip Layer Guidance ending at 1.0 it runs 36 of 60 transformer calls, 19 s → 13 s; ending at 0.75, 43 of 60, 20 s → 15 s. Nothing ghosts, and the fingertips keep their nails and flour flakes. Ending SLG at 1.0 is faster, and it changes the picture less than Spectrum itself does: the two unaccelerated pictures are nearly identical.
 
-![ER SDE 25 steps: no Spectrum, Manual default, warmup 5](img/ersde_manual.jpg)
+![ER SDE 30 steps at 1536x1536: no Spectrum and Adaptive, SLG ending at 1.0 and at 0.75, with fingertip crops](img/ersde_adaptive.jpg)
 
 What a long forecast streak does to ER SDE, and why Manual is capped at two forecasts in a row there:
 
