@@ -1,6 +1,6 @@
 # Neo-Spectrum-DiT
 #
-# ER-SDE solver-space bridge of ComfyUI-Spectrum-MOSS v0.8.0
+# ER-SDE solver-space bridge of ComfyUI-Spectrum-MOSS v0.8.1
 # (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS, er_sde_bridge.py), ported to Forge Neo.
 #
 # SPDX-License-Identifier: GPL-3.0-only
@@ -81,6 +81,7 @@ class ERSDESolverBridge:
         self.forecast_observations = 0
         self.hold_predictions = 0
         self.lambda_predictions = 0
+        self.lambda_continuation_predictions = 0
         self.bridge_fallbacks = 0
         self.mixed_observations = 0
         self.mixed_dense_predictions = 0
@@ -96,6 +97,7 @@ class ERSDESolverBridge:
         self.forecast_observations = 0
         self.hold_predictions = 0
         self.lambda_predictions = 0
+        self.lambda_continuation_predictions = 0
         self.bridge_fallbacks = 0
         self.mixed_observations = 0
         self.mixed_dense_predictions = 0
@@ -141,6 +143,7 @@ class ERSDESolverBridge:
             f"forecast_observations={self.forecast_observations} "
             f"latest_hold={self.hold_predictions} "
             f"lambda_dense={self.lambda_predictions} "
+            f"lambda_continue={self.lambda_continuation_predictions} "
             f"mixed={self.mixed_observations} "
             f"mixed_dense={self.mixed_dense_predictions} "
             f"mixed_raw_fallback={self.mixed_raw_fallbacks} "
@@ -218,6 +221,59 @@ class ERSDESolverBridge:
         )
         return latest.value.clone(memory_format=torch.contiguous_format)
 
+    def _predict_f2_continuation(self, step_id: int, raw: torch.Tensor) -> torch.Tensor:
+        """Continue F2 from the two latest ACTUAL anchors in ER-SDE lambda space.
+
+        Forecast outputs never become anchors. F3+ remains on the conservative
+        latest-actual hold path until a longer continuation horizon is validated.
+        """
+        latest = self._anchors[-1]
+        if len(self._anchors) < 2:
+            return self._latest_hold(step_id, raw, "continuation_hold_no_second_anchor")
+        previous = self._anchors[-2]
+        if (
+            not self._same_tensor_contract(previous.value, latest.value)
+            or not self._same_tensor_contract(latest.value, raw)
+        ):
+            return self._latest_hold(step_id, raw, "continuation_hold_contract_guard")
+
+        previous_coord = self._solver_coordinates.get(previous.step_id)
+        latest_coord = self._solver_coordinates.get(latest.step_id)
+        target_coord = self._solver_coordinates.get(step_id)
+        if previous_coord is None or latest_coord is None or target_coord is None:
+            return self._latest_hold(step_id, raw, "continuation_hold_missing_lambda")
+
+        denominator = latest_coord - previous_coord
+        advance = target_coord - latest_coord
+        alpha = advance / denominator
+        scale = torch.maximum(
+            torch.maximum(previous_coord.abs(), latest_coord.abs()),
+            torch.ones_like(latest_coord),
+        )
+        # Validated F2 cases need at most ~1.4x continuation. Keep a conservative
+        # 1.5x rail; longer forecast runs are not extrapolated by this path.
+        valid = (
+            torch.isfinite(alpha)
+            & torch.isfinite(denominator)
+            & (denominator.abs() > 1e-12 * scale)
+            & (denominator * advance >= 0.0)
+            & (alpha >= -1e-6)
+            & (alpha <= 1.5 + 1e-6)
+        )
+        if not bool(valid.item() if valid.numel() == 1 else valid.all().item()):
+            return self._latest_hold(step_id, raw, "continuation_hold_invalid_lambda")
+
+        weight = alpha.clamp(0.0, 1.5).to(device=latest.value.device, dtype=latest.value.dtype)
+        predicted = torch.lerp(latest.value, previous.value, -weight)
+        self.lambda_continuation_predictions += 1
+        alpha_scalar = float(alpha.detach().reshape(-1)[0].cpu())
+        _debug(
+            self.debug,
+            f"ER-SDE bridge step {step_id + 1}: mode=lambda_actual_anchor_continuation "
+            f"anchors=({previous.step_id + 1},{latest.step_id + 1}) alpha={alpha_scalar:.4f}",
+        )
+        return predicted
+
     def _predict_dense(self, step_id: int, raw: torch.Tensor, *, mixed: bool = False) -> torch.Tensor:
         if not mixed:
             self.forecast_observations += 1
@@ -231,6 +287,8 @@ class ERSDESolverBridge:
         latest = self._anchors[-1]
         mode_prefix = "mixed_" if mixed else ""
         if latest.step_id != step_id - 1:
+            if not mixed and latest.step_id == step_id - 2:
+                return self._predict_f2_continuation(step_id, raw)
             return self._latest_hold(step_id, raw, mode_prefix + "latest_actual_hold_nonadjacent")
         if len(self._anchors) < 2:
             return self._latest_hold(step_id, raw, mode_prefix + "latest_actual_hold")

@@ -1,6 +1,6 @@
 # Neo Spectrum DiT
 
-A **Forge Neo** extension that skips transformer evaluations on **MOSS-Image** and **FIBO 2** by forecasting them. It is a port of [Rkkss/ComfyUI-Spectrum-MOSS](https://github.com/Rkkss/ComfyUI-Spectrum-MOSS) v0.8.0 (MOSS-Image), extended to FIBO 2.
+A **Forge Neo** extension that skips transformer evaluations on **MOSS-Image** and **FIBO 2** by forecasting them. It is a port of [Rkkss/ComfyUI-Spectrum-MOSS](https://github.com/Rkkss/ComfyUI-Spectrum-MOSS) v0.8.1 (MOSS-Image), extended to FIBO 2.
 
 On a forecast step the transformer does not run. The extension predicts the image tokens' hidden state as it enters the model's output head, from the real steps before it (a ridge-regularised Chebyshev fit blended with linear extrapolation), and runs only that small, timestep-conditioned head on the prediction. In Adaptive mode this runs about 2x fewer transformer calls on MOSS-Image and about 1.5x fewer on FIBO 2, with a picture close to the unaccelerated one.
 
@@ -36,7 +36,7 @@ Open the **Spectrum DiT** accordion, tick it, and generate. The console reports 
 Every k-diffusion sampler runs with forecasts, including those that call the model more than once per step: Heun, DPM++ 2S and the RES4LYF samplers of [sd-forge-extra-samplers](https://github.com/aoleg/sd-forge-extra-samplers) (res_2s, res_2m, the radau, gauss-legendre and other implicit tableaus). A call between two schedule sigmas belongs to the step it falls in, and its hidden state enters the forecast history at its own position in that step.
 
 - Warmup and tail count **steps**. Max consecutive forecasts and Adaptive's horizon count **model calls**, so with a 2-stage sampler "3 in a row" spans about a step and a half.
-- **ER SDE** is detected and goes through the solver bridge automatically.
+- **ER SDE** is detected and goes through the solver bridge automatically. Each ER SDE step takes one real-or-forecast decision shared by the positive and negative prompts' model calls, so the solver never gets a half-forecast step it could have avoided.
 - Image quality was checked live with Euler and ER SDE on MOSS-Image. With any other sampler the console says so once per pass (Advanced → Warn on unverified samplers turns that off); nothing else changes. Adaptive is the safer mode there.
 
 ### MOSS-Image
@@ -63,7 +63,7 @@ First live results: FIBO 2 Dev (int8), 1728x1280, CFG 5, Beta schedule, one grou
 | Sampler | Transformer calls run | Sampling time | Speedup |
 | --- | --- | --- | --- |
 | Euler, 50 steps | 67 of 100 | 46 s → 32 s | 1.44x |
-| ER SDE, 25 steps | 34 of 50 | 23 s → 17 s | 1.35x |
+| ER SDE, 25 steps | 34 of 50 | 23 s → 17 s | 1.35x (at most one forecast in a row, before the ER SDE update described under Modes) |
 
 The composition, the background and the sharpness stay as in the unaccelerated picture, with no ghosting. What changes is small detail that is still being decided late, such as individual faces in a crowd. Adaptive backs off sooner on FIBO 2 than on MOSS-Image (about 1.5x fewer calls against about 2x), so FIBO 2's hidden state is harder to forecast at these settings. A longer tail (4 instead of 2) made no difference; a RES4LYF radau_ia_2s run at 15 steps came out almost identical to its baseline.
 
@@ -75,11 +75,11 @@ With the Manual defaults, Euler runs 42 of 100 transformer calls and the image s
 
 ![Euler 50 steps: no Spectrum, Manual default, warmup 6](img/euler_manual.jpg)
 
-Under ER SDE the default runs 34 of 50 calls. Warmup decides the layout here too.
+Under ER SDE, at most one forecast in a row (the limit before the ER SDE update described under Modes) ran 34 of 50 calls. Warmup decides the layout here too.
 
 ![ER SDE 25 steps: no Spectrum, Manual default, warmup 5](img/ersde_manual.jpg)
 
-What a longer forecast streak does to ER SDE, and why Manual is capped at one forecast in a row there:
+What a long forecast streak does to ER SDE, and why Manual is capped at two forecasts in a row there:
 
 ![ER SDE ghosting with up to 8 forecasts in a row](img/ersde_ghosting.jpg)
 
@@ -98,7 +98,7 @@ The original's **Spectrum MOSS-Image (Adaptive)** node, with its defaults. It is
 | Adaptive warmup steps | 8 | First steps that always run the transformer. |
 | Adaptive tail steps | 2 | Last steps that always run the transformer. |
 | Detail guard steps | 8 | After warmup, at most one forecast between real steps. |
-| Post-guard horizon cap | 6 | Longest forecast streak after the guard. ER SDE: 1. |
+| Post-guard horizon cap | 6 | Longest forecast streak after the guard. ER SDE: starts at 1 and can earn 2 when the measured error stays low, never more than this setting. |
 | Error tolerance | 1.0 | Forecast error tolerated before backing off. Higher = faster, riskier. |
 | Forecast budget | 2.0 | Starting forecast budget before the next real step (the node's `window_size`). ER SDE: ignored. |
 | Budget growth | 0.5 | How fast the budget grows after good refreshes (the node's `flex_window`). ER SDE: ignored. |
@@ -113,14 +113,14 @@ The original's **Spectrum MOSS-Image (Manual)** node: a fixed expanding-window s
 | Tail actual steps | 3 (2) | Last steps that always run the transformer. A longer tail (8) made no visible difference. |
 | Window size | 3.0 (2.0) | Starting forecast window before a real step. |
 | Window growth | 0.5 (0.75) | How much the window grows after each refresh. |
-| Max consecutive forecasts | 3 (2) | Forecasts allowed in a row before a real step. **ER SDE: always 1**, see below. |
-| History points | 8 | Real hidden states kept for the predictor. ER SDE: fixed at 8. |
-| Chebyshev degree | 4 | Polynomial degree of the predictor. ER SDE: fixed at 4. |
-| Ridge lambda | 0.1 | Regularisation; higher damps extrapolation. ER SDE: fixed at 0.1. |
-| Blend weight | 0.5 | 0 = linear extrapolation only, 1 = spectral only. ER SDE: fixed at 0.5. |
+| Max consecutive forecasts | 3 (2) | Forecasts allowed in a row before a real step. **ER SDE: at most 2**, see below. |
+| History points | 8 | Real hidden states kept for the predictor. |
+| Chebyshev degree | 4 | Polynomial degree of the predictor. |
+| Ridge lambda | 0.1 | Regularisation; higher damps extrapolation. |
+| Blend weight | 0.5 | 0 = linear extrapolation only, 1 = spectral only. |
 | Real steps while a ControlNet is active | on | |
 
-**ER SDE caps Manual at one forecast in a row,** whatever the slider says, which is where this port departs from the original node. The ER SDE bridge can only extrapolate from two consecutive real steps. After a longer streak it has to reuse the last real result while ER SDE keeps adding noise, and the image ghosts: doubled outlines and translucent duplicate fingers in a live test with 8 in a row. Adaptive already caps itself the same way. With the default warmup of 8, ER SDE at 25 steps runs about 1.5x fewer transformer calls.
+**ER SDE caps Manual at two forecasts in a row,** whatever the slider says, which is where this port departs from the original node. The ER SDE bridge forecasts the solver's result, not the hidden state: the first forecast after real steps extrapolates from the last two of them, and so does the second (since the original node's v0.8.1). From the third on, it can only reuse the last real result while ER SDE keeps adding noise, and the image ghosts: doubled outlines and translucent duplicate fingers in a live test with 8 in a row. Rarely the second forecast falls back to that reuse for one step, when the steps are spaced too unevenly to extrapolate safely. Adaptive is limited the same way: it starts ER SDE at one forecast in a row and moves to two only while its measured error stays low.
 
 ### Advanced
 
@@ -135,7 +135,7 @@ All settings are written to the infotext and restored by "Read generation parame
 
 ## Implementation notes
 
-The scheduler, the forecaster and the adaptive controller (`lib_spectrum_dit/core.py`) are the original node's code, unchanged apart from two flags that Forge supplies differently and the ER SDE cap on Manual described above. What is new:
+The scheduler, the forecaster and the adaptive controller (`lib_spectrum_dit/core.py`) are the original node's code (v0.8.1), unchanged apart from two flags that Forge supplies differently and the ER SDE cap on Manual described above. What is new:
 
 - **Model adapters** (`lib_spectrum_dit/models.py`). Per model: how to recognise it, where to capture the image tokens' hidden state (MOSS-Image: the last block's output; FIBO 2: the final layer's input, past the text "gist" tokens), how to run its output head on a forecast, and what starts a new forecast history (FIBO 2's text phase). FIBO 2 is recognised by its class name, so the extension does not depend on the fibo2-forge-neo extension being installed or loaded first.
 - **Hook.** The node wraps the diffusion model; Forge Neo's nearest hook is the `model_function_wrapper` around `KModel.apply_model`. A forecast step reproduces what `apply_model` does around the transformer: `calculate_input`, the head at `predictor.timestep(sigma)`, `calculate_denoised`. Another extension's wrapper already in that slot is chained, not replaced, and sees only the real steps.

@@ -4,7 +4,7 @@
 
 """
 Spectrum for MOSS-Image and FIBO 2 in WebUI Forge Neo: a port of Rkkss' ComfyUI-Spectrum-MOSS
-v0.8.0 (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS), extended to FIBO 2 (the
+v0.8.1 (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS), extended to FIBO 2 (the
 fibo2-forge-neo extension) through a per-model adapter (lib_spectrum_dit/models.py).
 
 Unlike the built-in "Spectrum Integrated", which forecasts the model's whole output, this
@@ -56,13 +56,13 @@ class NeoSpectrumDiT(scripts.Script):
                 with gr.Row():
                     manual_window_size = gr.Slider(minimum=1.0, maximum=16.0, value=3.0, step=0.25, label="Window size", info="starting forecast window before a real step")
                     manual_flex_window = gr.Slider(minimum=0.0, maximum=8.0, value=0.5, step=0.05, label="Window growth", info="how much the window grows after each refresh")
-                max_consecutive_forecasts = gr.Slider(minimum=0, maximum=32, value=3, step=1, label="Max consecutive forecasts", info="forecasts allowed in a row before a real step; higher = faster, riskier. ER SDE: 1")
+                max_consecutive_forecasts = gr.Slider(minimum=0, maximum=32, value=3, step=1, label="Max consecutive forecasts", info="forecasts allowed in a row before a real step; higher = faster, riskier. ER SDE: at most 2")
                 with gr.Row():
-                    history_points = gr.Slider(minimum=2, maximum=32, value=8, step=1, label="History points", info="real hidden states kept for the predictor; more uses more memory. ER SDE: ignored")
-                    chebyshev_degree = gr.Slider(minimum=1, maximum=12, value=4, step=1, label="Chebyshev degree", info="higher fits more complex trends, may be less stable. ER SDE: ignored")
+                    history_points = gr.Slider(minimum=2, maximum=32, value=8, step=1, label="History points", info="real hidden states kept for the predictor; more uses more memory")
+                    chebyshev_degree = gr.Slider(minimum=1, maximum=12, value=4, step=1, label="Chebyshev degree", info="higher fits more complex trends, may be less stable")
                 with gr.Row():
-                    ridge_lambda = gr.Slider(minimum=0.0, maximum=10.0, value=0.1, step=0.01, label="Ridge lambda", info="higher damps extrapolation more. ER SDE: ignored")
-                    blend_weight = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.01, label="Blend weight", info="0 = linear extrapolation only, 1 = spectral only. ER SDE: ignored")
+                    ridge_lambda = gr.Slider(minimum=0.0, maximum=10.0, value=0.1, step=0.01, label="Ridge lambda", info="higher damps extrapolation more")
+                    blend_weight = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.01, label="Blend weight", info="0 = linear extrapolation only, 1 = spectral only")
                 force_actual_on_control = gr.Checkbox(True, label="Real steps while a ControlNet is active")
 
             with gr.Group(visible=True) as g_adaptive:
@@ -72,7 +72,7 @@ class NeoSpectrumDiT(scripts.Script):
                 with gr.Row():
                     detail_guard_steps = gr.Slider(minimum=0, maximum=32, value=8, step=1, label="Detail guard steps", info="after warmup, at most one forecast between real steps; higher = safer early detail")
                 with gr.Row():
-                    post_guard_horizon_cap = gr.Slider(minimum=1, maximum=16, value=6, step=1, label="Post-guard horizon cap", info="longest forecast streak after the guard; higher = faster, riskier. ER SDE: 1")
+                    post_guard_horizon_cap = gr.Slider(minimum=1, maximum=16, value=6, step=1, label="Post-guard horizon cap", info="longest forecast streak after the guard; higher = faster, riskier. ER SDE: starts at 1, can earn 2")
                 error_tolerance = gr.Slider(minimum=0.75, maximum=1.5, value=1.0, step=0.05, label="Error tolerance", info="forecast error tolerated before backing off; higher = faster, riskier")
                 with gr.Row():
                     adaptive_window_size = gr.Slider(minimum=1.0, maximum=16.0, value=2.0, step=0.25, label="Forecast budget", info="starting forecast budget before the next real step. ER SDE: ignored")
@@ -253,8 +253,8 @@ class NeoSpectrumDiT(scripts.Script):
         p.sd_model.forge_objects.unet = patched
         p.extra_generation_params.update(params)
         if how == "er_sde":
-            capped = config.mode == "manual" and config.max_consecutive_forecasts > 1
-            logger.info("Spectrum DiT: ER SDE detected, forecasts go through the solver-space bridge" + (", at most 1 in a row" if capped else ""))
+            capped = config.mode == "manual" and config.max_consecutive_forecasts > 2
+            logger.info("Spectrum DiT: ER SDE detected, forecasts go through the solver-space bridge" + (", at most 2 in a row" if capped else ""))
 
     def postprocess(self, p, processed, *args):
         cls = NeoSpectrumDiT

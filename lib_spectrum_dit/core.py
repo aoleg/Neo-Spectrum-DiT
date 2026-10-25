@@ -1,10 +1,10 @@
 # Neo-Spectrum-DiT
 #
-# Scheduler, forecaster and adaptive controller of ComfyUI-Spectrum-MOSS v0.8.0
+# Scheduler, forecaster and adaptive controller of ComfyUI-Spectrum-MOSS v0.8.1
 # (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS, nodes.py), kept verbatim where it
 # does not touch ComfyUI so that Forge Neo makes the same actual/forecast decisions
-# as the validated node. One deliberate change: Manual is capped at one forecast in a
-# row under ER-SDE (`_runtime_config`).  Based on the method from arXiv:2603.01623.
+# as the validated node. One deliberate change: Manual is capped at two forecasts in a
+# row under ER-SDE (`_runtime_config`). Based on the method from arXiv:2603.01623.
 #
 # SPDX-License-Identifier: GPL-3.0-only
 
@@ -39,7 +39,6 @@ _ADAPTIVE_SAMPLE_TOKENS = 384
 _ADAPTIVE_HIGH_COOLDOWN_REFRESHES = 1
 
 
-
 def _log_debug(enabled: bool, msg: str) -> None:
     if enabled:
         logger.info(msg)
@@ -60,7 +59,7 @@ class SpectrumConfig:
 
     mode: str = "manual"
     warmup_steps: int = 8
-    tail_actual_steps: int = 2
+    tail_actual_steps: int = 1
     window_size: float = 2.0
     flex_window: float = 0.75
     max_consecutive_forecasts: int = 2  # Manual mode only.
@@ -78,6 +77,12 @@ class SpectrumConfig:
 
     debug: bool = False
     warn_unverified_sampler: bool = True
+
+    # Internal sampler-specific runtime policy; not exposed as node controls.
+    # ER-SDE uses synchronized branch lifecycle/decisions in both modes. Adaptive
+    # additionally enables the validated H1->H2 controller.
+    er_sde_sync: bool = False
+    er_sde_h2: bool = False
 
     @property
     def adaptive(self) -> bool:
@@ -363,6 +368,14 @@ class HistoryWeightChebyshevForecaster:
         return out
 
 
+def _initial_adaptive_horizon(config: SpectrumConfig) -> int:
+    # Native ER-SDE starts conservatively at H1 and must earn H2 through the
+    # existing error controller. Other samplers keep the legacy Adaptive policy.
+    if config.er_sde_h2:
+        return 1
+    return max(1, config.post_guard_horizon_cap)
+
+
 @dataclass
 class SpectrumBranchState:
     config: SpectrumConfig
@@ -384,6 +397,9 @@ class SpectrumBranchState:
     last_local_ratio: Optional[float] = None
     last_validation_tier: str = "learning"
     last_streak: int = 0
+    horizon_upgrades: int = 0
+    horizon_downgrades: int = 0
+    repair_events: int = 0
 
     # Temporary guard after a local anomaly, counted in validation refreshes.
     cooldown_refreshes_remaining: int = 0
@@ -392,7 +408,7 @@ class SpectrumBranchState:
     def __post_init__(self) -> None:
         self.current_window = float(self.config.window_size)
         self.adaptive_horizon = (
-            max(1, self.config.post_guard_horizon_cap)
+            _initial_adaptive_horizon(self.config)
             if self.config.adaptive
             else max(1, self.config.max_consecutive_forecasts)
         )
@@ -413,7 +429,7 @@ class SpectrumBranchState:
         self.baseline_p99 = None
         self.baseline_observations = 0
         self.adaptive_horizon = (
-            max(1, self.config.post_guard_horizon_cap)
+            _initial_adaptive_horizon(self.config)
             if self.config.adaptive
             else max(1, self.config.max_consecutive_forecasts)
         )
@@ -424,6 +440,9 @@ class SpectrumBranchState:
         self.last_local_ratio = None
         self.last_validation_tier = "learning"
         self.last_streak = 0
+        self.horizon_upgrades = 0
+        self.horizon_downgrades = 0
+        self.repair_events = 0
         self.cooldown_refreshes_remaining = 0
         self.cooldown_horizon_cap = None
 
@@ -445,6 +464,17 @@ class SpectrumRootState:
     # full schedule even when img2img or the hires pass samples only its tail.
     step_offset: Optional[int] = None
 
+    # Active patch signature for each CFG/SLG cond branch while Adaptive ER-SDE
+    # synchronization is in use. Partial SLG windows can replace a branch key
+    # mid-run. Historical branches stay in ``branches`` for statistics only.
+    active_branch_keys: dict[Any, Any] = field(default_factory=dict)
+
+    # One global Adaptive ER-SDE A/F decision is cached per solver step so
+    # CFG/SLG branches cannot choose different modes.
+    global_decision_step: Optional[int] = None
+    global_decision_actual: Optional[bool] = None
+    global_decision_reason: Optional[str] = None
+
     def reset_run(self) -> None:
         self.branches.clear()
         self.last_sigmas_id = None
@@ -452,12 +482,48 @@ class SpectrumRootState:
         self.last_step_index = None
         self.completed_branches.clear()
         self.summary_logged = False
+        self.active_branch_keys.clear()
+        self.global_decision_step = None
+        self.global_decision_actual = None
+        self.global_decision_reason = None
         self.step_offset = None
 
     def branch(self, key: Any) -> SpectrumBranchState:
         if key not in self.branches:
             self.branches[key] = SpectrumBranchState(_runtime_config(self.config, self.er_sde))
         return self.branches[key]
+
+    def activate_er_sde_branch(self, cond_key: Any, branch_key: Any, debug: bool = False) -> None:
+        """Make ``branch_key`` the sole active ER-SDE branch for ``cond_key``.
+
+        SkipLayerGuidanceDiTSimple changes its DiT patch signature when a partial
+        guidance window starts/ends. That intentionally creates a fresh history;
+        the superseded state must be retired from the global scheduler.
+        """
+        previous = self.active_branch_keys.get(cond_key)
+        if previous == branch_key:
+            return
+        if previous is not None:
+            old_branch = self.branches.get(previous)
+            if old_branch is not None:
+                old_branch.forecaster.release_features()
+            _log_debug(
+                debug,
+                f"ER-SDE branch transition cond={cond_key}: "
+                f"retire={previous} activate={branch_key}",
+            )
+        self.active_branch_keys[cond_key] = branch_key
+
+    def active_branch_items(self) -> list[tuple[Any, SpectrumBranchState]]:
+        items: list[tuple[Any, SpectrumBranchState]] = []
+        for key in self.active_branch_keys.values():
+            branch = self.branches.get(key)
+            if branch is not None:
+                items.append((key, branch))
+        return items
+
+    def active_branch_key_set(self) -> set[Any]:
+        return {key for key in self.active_branch_keys.values() if key in self.branches}
 
 
 def _find_step_index(sigmas: torch.Tensor, timestep: torch.Tensor) -> int:
@@ -503,37 +569,35 @@ def _patch_signature(transformer_options: dict) -> tuple[str, ...]:
 
 
 def _runtime_config(config: SpectrumConfig, er_sde: bool) -> SpectrumConfig:
-    """Apply only sampler-specific runtime policy overrides.
-
-    ER-SDE uses the predictor settings validated by the bridge tests. Adaptive
-    keeps its error/guard logic, but ER-SDE caps the forecast horizon at one and
-    therefore ignores its window-growth controls.
-
-    Neo-Spectrum-DiT departs from the node here: Manual is capped at one
-    forecast in a row as well. The bridge extrapolates only from two adjacent
-    real steps; after a longer streak it holds the last real result while ER
-    SDE keeps adding noise, which ghosts (seen live on 2026-10-22).
-    """
+    """Apply sampler-specific runtime policy without changing the public node UI."""
     if not er_sde:
         return config
     if config.adaptive:
         return replace(
             config,
-            window_size=1.0,
+            window_size=2.0,
             flex_window=0.0,
-            post_guard_horizon_cap=1,
+            post_guard_horizon_cap=min(config.post_guard_horizon_cap, 2),
             history_points=_ADAPTIVE_HISTORY_POINTS,
             chebyshev_degree=_ADAPTIVE_CHEBYSHEV_DEGREE,
             ridge_lambda=_ADAPTIVE_RIDGE_LAMBDA,
             blend_weight=_ADAPTIVE_BLEND_WEIGHT,
+            er_sde_sync=True,
+            er_sde_h2=True,
         )
+
+    # Manual stays manual under ER-SDE: keep every user-selected predictor and
+    # cadence control. Only add solver-safe branch synchronization/lifecycle.
+    #
+    # Neo-Spectrum-DiT departs from the node here: Manual is capped at two forecasts
+    # in a row. The bridge extrapolates F1 and F2 from real anchors; from F3 on it holds
+    # the last real result while ER SDE keeps adding noise, which ghosts (seen live on
+    # 2026-10-22 with eight in a row).
     return replace(
         config,
-        max_consecutive_forecasts=min(config.max_consecutive_forecasts, 1),
-        history_points=_ADAPTIVE_HISTORY_POINTS,
-        chebyshev_degree=_ADAPTIVE_CHEBYSHEV_DEGREE,
-        ridge_lambda=_ADAPTIVE_RIDGE_LAMBDA,
-        blend_weight=_ADAPTIVE_BLEND_WEIGHT,
+        er_sde_sync=True,
+        er_sde_h2=False,
+        max_consecutive_forecasts=min(config.max_consecutive_forecasts, 2),
     )
 
 
@@ -592,6 +656,99 @@ def _choose_actual(
         return True, "window"
     return False, "forecast"
 
+
+def _choose_actual_global_er_sde_adaptive(
+    root: SpectrumRootState,
+    step_index: int,
+    total_steps: int,
+    control_present: bool,
+    config: SpectrumConfig,
+) -> tuple[bool, str]:
+    """Choose one conservative A/F mode for every Adaptive ER-SDE branch.
+
+    Per-branch error estimation remains independent, but the least-permissive
+    active CFG/SLG branch owns the shared solver-step decision.
+    """
+    if step_index < 0:
+        return True, "unknown_step"
+    if step_index < config.warmup_steps:
+        return True, "warmup"
+    if config.tail_actual_steps > 0 and step_index >= max(0, total_steps - config.tail_actual_steps):
+        return True, "tail"
+    if control_present and config.force_actual_on_control:
+        return True, "control"
+
+    # Only currently active branch signatures participate. A partial SLG window
+    # can leave historical branch states in root.branches; including those here
+    # makes stale error/readiness state permanently throttle the shared cadence.
+    branches = [b for _, b in root.active_branch_items()]
+    if not branches or any(not b.forecaster.ready() for b in branches):
+        return True, "insufficient_history"
+    if any(b.repair_actual_steps_remaining > 0 for b in branches):
+        return True, "local_repair"
+
+    phase_cap = _adaptive_phase_horizon_cap(config, step_index)
+    effective_caps: list[int] = []
+    window_caps: list[int] = []
+    safety_caps: list[int] = []
+    for b in branches:
+        window_cap = max(1, int(math.floor(b.current_window)))
+        safety_cap = min(max(1, b.adaptive_horizon), phase_cap)
+        if b.cooldown_refreshes_remaining > 0 and b.cooldown_horizon_cap is not None:
+            safety_cap = min(safety_cap, max(1, b.cooldown_horizon_cap))
+        window_caps.append(window_cap)
+        safety_caps.append(safety_cap)
+        effective_caps.append(min(window_cap, safety_cap))
+
+    # Conservative shared cap: the least permissive branch owns the step.
+    effective_cap = min(effective_caps)
+    max_streak = max(b.consecutive_forecasts for b in branches)
+    if max_streak >= effective_cap:
+        window_cap = min(window_caps)
+        safety_cap = min(safety_caps)
+        return True, "window" if window_cap <= safety_cap else "local_guard"
+    return False, "forecast"
+
+
+def _choose_actual_global_er_sde_manual(
+    root: SpectrumRootState,
+    step_index: int,
+    total_steps: int,
+    control_present: bool,
+    config: SpectrumConfig,
+) -> tuple[bool, str]:
+    """Choose one ER-SDE A/F mode while preserving Manual cadence controls.
+
+    Manual does not use the Adaptive error controller. The user-selected warmup,
+    tail, window/flex growth and max-consecutive-forecast limits remain authoritative;
+    the least-ready active CFG/SLG branch only synchronizes the shared solver step.
+    """
+    if step_index < 0:
+        return True, "unknown_step"
+    if step_index < config.warmup_steps:
+        return True, "warmup"
+    if config.tail_actual_steps > 0 and step_index >= max(0, total_steps - config.tail_actual_steps):
+        return True, "tail"
+    if control_present and config.force_actual_on_control:
+        return True, "control"
+
+    branches = [b for _, b in root.active_branch_items()]
+    if not branches or any(not b.forecaster.ready() for b in branches):
+        return True, "insufficient_history"
+
+    if config.max_consecutive_forecasts <= 0:
+        return True, "horizon_refresh"
+    if any(b.consecutive_forecasts >= config.max_consecutive_forecasts for b in branches):
+        return True, "horizon_refresh"
+
+    # Preserve the original Manual expanding-window scheduler. If active branch
+    # histories differ around a partial SLG transition, the most conservative
+    # branch wins the shared ER-SDE decision.
+    intervals = [max(1, int(math.floor(b.current_window))) for b in branches]
+    if any((b.consecutive_forecasts + 1) % interval == 0 for b, interval in zip(branches, intervals)):
+        return True, "window"
+    return False, "forecast"
+
 def _note_decision(state: SpectrumBranchState, actual: bool, reason: str, config: SpectrumConfig) -> None:
     if actual:
         state.consecutive_forecasts = 0
@@ -606,7 +763,6 @@ def _note_decision(state: SpectrumBranchState, actual: bool, reason: str, config
     else:
         state.consecutive_forecasts += 1
         state.forecast_count += 1
-
 
 
 def _adaptive_validate_and_update(
@@ -667,6 +823,8 @@ def _adaptive_validate_and_update(
 
     branch.last_local_ratio = ratio
     branch.last_validation_tier = tier
+    horizon_before = branch.adaptive_horizon
+    repair_before = branch.repair_actual_steps_remaining
 
     if allow_action and branch.baseline_observations >= 3:
         if tier == "high":
@@ -680,6 +838,8 @@ def _adaptive_validate_and_update(
             branch.repair_actual_steps_remaining = max(
                 branch.repair_actual_steps_remaining, _ADAPTIVE_REPAIR_ACTUAL_STEPS
             )
+            if repair_before <= 0 and branch.repair_actual_steps_remaining > 0:
+                branch.repair_events += 1
             branch.cooldown_refreshes_remaining = max(
                 branch.cooldown_refreshes_remaining, _ADAPTIVE_HIGH_COOLDOWN_REFRESHES
             )
@@ -703,6 +863,21 @@ def _adaptive_validate_and_update(
                     branch.adaptive_horizon = min(max_h, branch.adaptive_horizon + 1)
                     branch.safe_refreshes = 0
 
+    if branch.adaptive_horizon > horizon_before:
+        branch.horizon_upgrades += 1
+        _log_debug(
+            config.debug,
+            f"adaptive horizon upgrade {horizon_before}->{branch.adaptive_horizon} "
+            f"tier={tier} ratio={ratio:.3f}",
+        )
+    elif branch.adaptive_horizon < horizon_before:
+        branch.horizon_downgrades += 1
+        _log_debug(
+            config.debug,
+            f"adaptive horizon downgrade {horizon_before}->{branch.adaptive_horizon} "
+            f"tier={tier} ratio={ratio:.3f}",
+        )
+
     _log_debug(
         config.debug,
         f"local tier={tier} p95={p95:.5f} p99={p99:.5f} "
@@ -713,3 +888,14 @@ def _adaptive_validate_and_update(
         f"cooldown={branch.cooldown_refreshes_remaining} "
         f"coolcap={branch.cooldown_horizon_cap if branch.cooldown_horizon_cap is not None else 'none'}",
     )
+
+def _adaptive_phase_name(config: SpectrumConfig, step_index: int, total_steps: int) -> str:
+    if step_index < config.warmup_steps:
+        return "warmup"
+    tail_start = max(0, total_steps - config.tail_actual_steps) if config.tail_actual_steps > 0 else total_steps
+    if step_index >= tail_start:
+        return "tail"
+    guard_end = config.warmup_steps + max(0, config.detail_guard_steps)
+    if step_index < guard_end:
+        return "guard"
+    return "post_guard"

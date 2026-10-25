@@ -1,6 +1,6 @@
 # Neo-Spectrum-DiT
 #
-# Forge Neo adapter for the ComfyUI-Spectrum-MOSS v0.8.0 diffusion-model wrapper
+# Forge Neo adapter for the ComfyUI-Spectrum-MOSS v0.8.1 diffusion-model wrapper
 # (https://github.com/Rkkss/ComfyUI-Spectrum-MOSS, nodes.py).
 #
 # SPDX-License-Identifier: GPL-3.0-only
@@ -36,7 +36,10 @@ from .core import (
     SpectrumConfig,
     SpectrumRootState,
     _adaptive_validate_and_update,
+    _adaptive_phase_name,
     _choose_actual,
+    _choose_actual_global_er_sde_adaptive,
+    _choose_actual_global_er_sde_manual,
     _log_debug,
     _log_warning,
     _note_decision,
@@ -236,6 +239,7 @@ def make_wrapper(
         _log_debug(
             runtime_config.debug,
             f"step {step_index + 1}/{total_steps} branch={branch_key} "
+            f"phase={_adaptive_phase_name(runtime_config, step_index, total_steps) if runtime_config.adaptive else 'manual'} "
             f"mode=actual reason={reason} history={branch.forecaster.history_size} "
             f"p95={branch.last_p95 if branch.last_p95 is not None else 'n/a'} "
             f"p99={branch.last_p99 if branch.last_p99 is not None else 'n/a'} "
@@ -252,6 +256,7 @@ def make_wrapper(
         _log_debug(
             runtime_config.debug,
             f"step {step_index + 1}/{total_steps} branch={branch_key} "
+            f"phase={_adaptive_phase_name(runtime_config, step_index, total_steps) if runtime_config.adaptive else 'manual'} "
             f"mode=forecast history={branch.forecaster.history_size} "
             f"ratio={branch.last_local_ratio if branch.last_local_ratio is not None else 'n/a'} "
             f"tier={branch.last_validation_tier} horizon={branch.adaptive_horizon} "
@@ -310,6 +315,8 @@ def make_wrapper(
         branch_key = (cond_key, patch_key) + ((model_key,) if model_key else ())
         branch = root.branch(branch_key)
         runtime_config = branch.config
+        if runtime_config.er_sde_sync:
+            root.activate_er_sde_branch(cond_key, branch_key, runtime_config.debug)
 
         image_tokens = int(x.shape[-2]) * int(x.shape[-1])
         known_shape = branch.forecaster.feature_shape
@@ -317,7 +324,44 @@ def make_wrapper(
             branch.reset()
 
         control_present = c.get("control") is not None or transformer_options.get("control") is not None
-        actual, reason = _choose_actual(branch, step_index, total_steps, control_present, runtime_config)
+        if runtime_config.er_sde_sync:
+            # ER-SDE (node 0.8.1): one actual/forecast decision per solver step, shared by
+            # every active CFG/SLG branch, so the bridge never sees a mixed step it could avoid
+            if root.global_decision_step != step_index:
+                if runtime_config.er_sde_h2:
+                    actual, reason = _choose_actual_global_er_sde_adaptive(root, step_index, total_steps, control_present, runtime_config)
+                else:
+                    actual, reason = _choose_actual_global_er_sde_manual(root, step_index, total_steps, control_present, runtime_config)
+                root.global_decision_step = step_index
+                root.global_decision_actual = bool(actual)
+                root.global_decision_reason = reason
+                if runtime_config.debug:
+                    active_items = root.active_branch_items()
+                    if runtime_config.er_sde_h2:
+                        ratios = [b.last_local_ratio for _, b in active_items if b.last_local_ratio is not None]
+                        horizons = [b.adaptive_horizon for _, b in active_items]
+                        _log_debug(
+                            True,
+                            f"ER-SDE adaptive global decision step {step_index + 1}: "
+                            f"mode={'actual' if actual else 'forecast'} reason={reason} "
+                            f"worst_ratio={max(ratios) if ratios else 'n/a'} "
+                            f"branch_horizons={horizons}",
+                        )
+                    else:
+                        windows = [round(b.current_window, 3) for _, b in active_items]
+                        streaks = [b.consecutive_forecasts for _, b in active_items]
+                        _log_debug(
+                            True,
+                            f"ER-SDE manual global decision step {step_index + 1}: "
+                            f"mode={'actual' if actual else 'forecast'} reason={reason} "
+                            f"current_windows={windows} streaks={streaks} "
+                            f"max_consecutive={runtime_config.max_consecutive_forecasts}",
+                        )
+            else:
+                actual = bool(root.global_decision_actual)
+                reason = root.global_decision_reason or ("actual" if actual else "forecast")
+        else:
+            actual, reason = _choose_actual(branch, step_index, total_steps, control_present, runtime_config)
         coord = _coordinate(position - root.step_offset, total_steps)
 
         try:
@@ -359,7 +403,10 @@ def make_wrapper(
                     _log_debug(
                         True,
                         f"run complete: branches={len(root.branches)} actual={actual_calls} "
-                        f"forecast={forecast_calls} calls={total_calls} theoretical_transformer_speedup={ratio:.2f}x",
+                        f"forecast={forecast_calls} calls={total_calls} theoretical_transformer_speedup={ratio:.2f}x "
+                        f"horizon_up={sum(b.horizon_upgrades for b in root.branches.values())} "
+                        f"horizon_down={sum(b.horizon_downgrades for b in root.branches.values())} "
+                        f"repair_events={sum(b.repair_events for b in root.branches.values())}",
                     )
                 root.summary_logged = True
                 for b in root.branches.values():
